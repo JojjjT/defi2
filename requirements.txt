@@ -1,0 +1,7 @@
+yfinance
+pandas
+numpy
+FinStoch
+pyarrow
+jupyter
+jupyter-cache

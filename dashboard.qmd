@@ -1,0 +1,519 @@
+---
+title: "DEFI 2 — Calibración y simulación de modelos estocásticos"
+jupyter: defi2
+format:
+  dashboard:
+    output-file: index.html
+    css: styles.css
+---
+
+```{python}
+#| context: setup
+#| echo: false
+import numpy as np
+import pandas as pd
+from FinStoch import VasicekModel, MertonJumpDiffusion, OrnsteinUhlenbeck
+
+px = pd.read_parquet("data/prices.parquet")
+ojs_define(dates=px.index.strftime("%Y-%m-%d").tolist(), prices={t: px[t].tolist() for t in px})
+
+def calibrar(modelo, f, nombres):
+    tab = {t: modelo.calibrate(f(px[t].values), dt=1 / 252) for t in px}
+    return pd.DataFrame(tab).T.rename(columns=nombres).round(4)
+
+tabV = calibrar(VasicekModel, lambda s: s, {"a": "κ", "mu": "θ", "sigma": "σ"})
+tabO = calibrar(OrnsteinUhlenbeck, np.log, {"theta": "θ", "mu": "μ", "sigma": "σ"})
+tabM = calibrar(MertonJumpDiffusion, lambda s: s,
+                {"mu": "μ", "sigma": "σ", "lambda_j": "λ", "mu_j": "μ_J", "sigma_j": "σ_J"})
+```
+
+```{ojs}
+//| output: false
+Plotly = require("https://cdn.plot.ly/plotly-2.35.2.min.js")
+```
+
+```{ojs}
+//| output: false
+tickers = Object.keys(prices)
+```
+
+```{ojs}
+//| output: false
+lib = {
+  const dt = 1 / 252;
+  const sum = a => a.reduce((s, x) => s + x, 0);
+  const mean = a => sum(a) / a.length;
+  const sd = a => { const m = mean(a); return Math.sqrt(sum(a.map(x => (x - m) ** 2)) / (a.length - 1)); };
+  const quantile = (s, q) => { const p = (s.length - 1) * q, i = Math.floor(p), j = Math.min(i + 1, s.length - 1); return s[i] + (s[j] - s[i]) * (p - i); };
+  const iso = d => new Date(d).toISOString().slice(0, 10);
+  const bisect = (a, v, right) => {
+    let lo = 0, hi = a.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (right ? a[m] <= v : a[m] < v) lo = m + 1; else hi = m; }
+    return lo;
+  };
+  const between = (from, to) => {
+    const i1 = Math.min(Math.max(bisect(dates, iso(to), true) - 1, 30), dates.length - 1);
+    return [Math.max(Math.min(bisect(dates, iso(from), false), i1 - 30), 0), i1];
+  };
+  const bdays = (start, n) => {
+    const out = [start];
+    let d = new Date(start + "T00:00:00Z");
+    while (out.length < n + 1) { d = new Date(d.getTime() + 864e5); const w = d.getUTCDay(); if (w !== 0 && w !== 6) out.push(iso(d)); }
+    return out;
+  };
+  const rng = seed => {
+    let a = seed >>> 0;
+    const u = () => { a = (a + 0x6D2B79F5) >>> 0; let t = Math.imul(a ^ (a >>> 15), a | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+    const z = () => Math.sqrt(-2 * Math.log(1 - u())) * Math.cos(2 * Math.PI * u());
+    const pois = l => { const L = Math.exp(-l); let k = 0, p = u(); while (p > L) { k++; p *= u(); } return k; };
+    return {z, pois};
+  };
+  const fmt = x => !isFinite(x) ? "—" : (x !== 0 && (Math.abs(x) >= 1e5 || Math.abs(x) < 1e-3)) ? x.toExponential(2) : x.toFixed(4);
+  const ranges = [1, 3, 6].map(m => ({count: m, label: `${m}m`, step: "month", stepmode: "backward"}))
+    .concat([{count: 1, label: "1a", step: "year", stepmode: "backward"}, {step: "all", label: "todo"}]);
+
+  const plot = (data, layout = {}, height = 440) => {
+    const div = document.createElement("div");
+    div.style.width = "100%";
+    const calcH = () => div.clientWidth < 520 ? Math.max(300, Math.round(height * 0.75)) : height;
+    let drawn = false;
+    const render = () => {
+      if (!div.clientWidth) return;               // pestaña oculta o aún sin ancho: se dibuja al tener tamaño
+      if (!drawn) {
+        drawn = true;
+        Plotly.newPlot(div, data, {height: calcH(), margin: {l: 55, r: 15, t: 20, b: 40}, hovermode: "x unified", legend: {orientation: "h", y: -0.15}, ...layout}, {responsive: true, displaylogo: false});
+      } else Plotly.relayout(div, {autosize: true, height: calcH()});
+    };
+    if (window.ResizeObserver) new ResizeObserver(render).observe(div);
+    else { let t = 0; const poll = () => { render(); if (!drawn && t++ < 600) requestAnimationFrame(poll); }; requestAnimationFrame(poll); }
+    return div;
+  };
+  const table = (head, rows) => {
+    const d = document.createElement("div");
+    d.innerHTML = `<table class="table table-sm"><thead><tr>${head.map(h => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    return d;
+  };
+
+  const calibAR = x => {
+    const X = x.slice(0, -1), Y = x.slice(1), n = X.length, mx = mean(X), my = mean(Y);
+    let sxy = 0, sxx = 0, sst = 0;
+    for (let i = 0; i < n; i++) { sxy += (X[i] - mx) * (Y[i] - my); sxx += (X[i] - mx) ** 2; sst += (Y[i] - my) ** 2; }
+    const b = sxy / sxx, a = my - b * mx;
+    const sse = sum(Y.map((y, i) => (y - a - b * X[i]) ** 2));
+    const reverting = b > 0 && b < 1;
+    const kappa = reverting ? -Math.log(b) / dt : 1e-3;
+    const level = reverting ? a / (1 - b) : mx;
+    const s2 = sse / (n - 2);
+    const sigma = reverting ? Math.sqrt(s2 * 2 * kappa / (1 - b * b)) : Math.sqrt(s2 / dt);
+    return {X, Y, n, a, b, r2: 1 - sse / sst, reverting, kappa, level, sigma, halfLife: Math.log(2) / kappa * 252, lo: Math.min(...X), hi: Math.max(...X)};
+  };
+  const calibMerton = (logp, k) => {
+    const r = logp.slice(1).map((v, i) => v - logp[i]);
+    let m = mean(r), s = sd(r);
+    for (let it = 0; it < 20; it++) {
+      const d = r.filter(x => Math.abs(x - m) <= k * s);
+      m = mean(d); s = sd(d);
+    }
+    const jump = r.map(x => Math.abs(x - m) > k * s);
+    const J = r.filter((x, i) => jump[i]).map(x => x - m);
+    const sigma = s / Math.sqrt(dt), lambda = J.length / (r.length * dt);
+    const muJ = J.length ? mean(J) : 0, sigJ = J.length > 1 ? sd(J) : 0.02;
+    const kk = Math.exp(muJ + sigJ ** 2 / 2) - 1;
+    return {r, jump, m, s, k, sigma, lambda, muJ, sigJ, nJ: J.length, mu: m / dt + sigma ** 2 / 2 + lambda * kk};
+  };
+
+  const simMR = (x0, kappa, level, sigma, steps, n, seed, tf = x => x) => {
+    const R = rng(seed), k = Math.max(kappa, 1e-6), e = Math.exp(-k * dt), s = sigma * Math.sqrt((1 - e * e) / (2 * k));
+    return Array.from({length: n}, () => {
+      const p = new Float64Array(steps + 1); p[0] = x0;
+      for (let i = 0; i < steps; i++) p[i + 1] = level + (p[i] - level) * e + s * R.z();
+      return p.map(v => tf(v));
+    });
+  };
+  const simMerton = (x0, q, steps, n, seed) => {
+    const R = rng(seed), kk = Math.exp(q.muJ + q.sigJ ** 2 / 2) - 1;
+    const drift = (q.mu - q.sigma ** 2 / 2 - q.lambda * kk) * dt, vol = q.sigma * Math.sqrt(dt);
+    return Array.from({length: n}, () => {
+      const p = new Float64Array(steps + 1); p[0] = x0;
+      for (let i = 0; i < steps; i++) {
+        const N = R.pois(q.lambda * dt);
+        p[i + 1] = p[i] + drift + vol * R.z() + (N ? N * q.muJ + Math.sqrt(N) * q.sigJ * R.z() : 0);
+      }
+      return p.map(v => Math.exp(v));
+    });
+  };
+  const fan = paths => {
+    const out = {mean: [], lo: [], hi: []};
+    for (let i = 0; i < paths[0].length; i++) {
+      const col = Float64Array.from(paths, p => p[i]).sort();
+      out.mean.push(mean(col)); out.lo.push(quantile(col, 0.05)); out.hi.push(quantile(col, 0.95));
+    }
+    return out;
+  };
+
+  const simFigure = ({ticker, i0, i1, paths, level, levelName}) => {
+    const steps = paths[0].length - 1, h = prices[ticker], fut = bdays(dates[i1], steps), f = fan(paths), px = [], py = [];
+    paths.slice(0, 30).forEach(p => { for (let i = 0; i <= steps; i++) { px.push(fut[i]); py.push(p[i]); } px.push(null); py.push(null); });
+    const data = [
+      {x: dates.slice(0, i1 + 1), y: h.slice(0, i1 + 1), name: "Real (ventana de calibración)", line: {color: "black", width: 1.5}},
+      {x: dates.slice(i1), y: h.slice(i1), name: "Real (posterior)", line: {color: "#d62728", width: 1.5}},
+      {x: px, y: py, name: "Trayectorias (30)", line: {color: "rgba(120,120,120,0.35)", width: 0.7}, hoverinfo: "skip"},
+      {x: fut, y: f.hi, name: "P95", line: {width: 0}, showlegend: false},
+      {x: fut, y: f.lo, name: "Banda P5–P95", fill: "tonexty", fillcolor: "rgba(31,119,180,0.2)", line: {width: 0}},
+      {x: fut, y: f.mean, name: "Media simulada", line: {color: "#1f77b4", width: 2}}
+    ];
+    if (level != null) data.push({x: [dates[i0], fut[steps]], y: [level, level], name: levelName, line: {color: "green", dash: "dash", width: 1}});
+    return plot(data, {
+      yaxis: {title: "USD"},
+      xaxis: {range: [dates[Math.max(i0, i1 - 504)], fut[steps]], rangeselector: {buttons: ranges}},
+      shapes: [{type: "rect", xref: "x", yref: "paper", x0: dates[i0], x1: dates[i1], y0: 0, y1: 1, fillcolor: "rgba(0,0,0,0.06)", line: {width: 0}, layer: "below"}],
+      annotations: [{x: dates[i0], y: 1, xref: "x", yref: "paper", text: "ventana de calibración", showarrow: false, xanchor: "left", yanchor: "bottom"}]
+    }, 500);
+  };
+  const arFigure = (c, xl, yl) => {
+    const span = c.hi - c.lo, ends = [c.lo, c.hi];
+    const data = [
+      {x: c.X, y: c.Y, mode: "markers", name: "Pares (xₜ, xₜ₊₁)", marker: {size: 4, color: "rgba(80,80,80,0.5)"}},
+      {x: ends, y: ends.map(v => c.a + c.b * v), mode: "lines", name: "Ajuste MCO", line: {color: "#d62728", width: 2}},
+      {x: ends, y: ends, mode: "lines", name: "xₜ₊₁ = xₜ", line: {color: "black", dash: "dash", width: 1}}
+    ];
+    if (c.reverting && c.level > c.lo - span && c.level < c.hi + span)
+      data.push({x: [c.level], y: [c.level], mode: "markers", name: "Nivel de equilibrio", marker: {symbol: "x", size: 12, color: "green"}});
+    return plot(data, {
+      hovermode: "closest", xaxis: {title: xl}, yaxis: {title: yl},
+      annotations: [{xref: "paper", yref: "paper", x: 0.02, y: 0.98, xanchor: "left", yanchor: "top", showarrow: false, bgcolor: "white",
+        text: `xₜ₊₁ = ${c.a.toFixed(3)} + ${c.b.toFixed(5)}·xₜ<br>R² = ${c.r2.toFixed(4)} · n = ${c.n}${c.reverting ? "" : "<br>b ≥ 1: sin reversión"}`}]
+    }, 420);
+  };
+  const retFigure = (c, i0) => {
+    const x = dates.slice(i0 + 1, i0 + 1 + c.r.length), pick = f => ({x: x.filter((_, i) => f(i)), y: c.r.filter((_, i) => f(i))});
+    const line = (y, text) => ({type: "line", xref: "paper", x0: 0, x1: 1, y0: y, y1: y, line: {color: "black", dash: "dash", width: 1}});
+    return plot([
+      {...pick(i => !c.jump[i]), mode: "markers", name: "Difusión", marker: {size: 3, color: "rgba(80,80,80,0.6)"}},
+      {...pick(i => c.jump[i]), mode: "markers", name: `Saltos (${c.nJ})`, marker: {size: 7, color: "#d62728"}}
+    ], {
+      hovermode: "closest", yaxis: {title: "retorno log diario"},
+      shapes: [line(c.m + c.k * c.s), line(c.m - c.k * c.s)],
+      annotations: [{xref: "paper", x: 1, y: c.m + c.k * c.s, text: `+${c.k}σ`, showarrow: false, xanchor: "right", yanchor: "bottom"},
+                    {xref: "paper", x: 1, y: c.m - c.k * c.s, text: `−${c.k}σ`, showarrow: false, xanchor: "right", yanchor: "top"}]
+    }, 420);
+  };
+  const histFigure = (c) => {
+    const bin = c.s / 4, N = c.r.length, lim = 6 * c.s, xs = Array.from({length: 241}, (_, i) => c.m - lim + i * lim / 120);
+    return plot([
+      {type: "histogram", x: c.r.filter((_, i) => !c.jump[i]), xbins: {size: bin}, name: "Difusión", marker: {color: "rgba(80,80,80,0.6)"}},
+      {type: "histogram", x: c.r.filter((_, i) => c.jump[i]), xbins: {size: bin}, name: "Saltos", marker: {color: "#d62728"}},
+      {x: xs, y: xs.map(v => N * bin * Math.exp(-0.5 * ((v - c.m) / c.s) ** 2) / (c.s * Math.sqrt(2 * Math.PI))), mode: "lines", name: "Normal de la difusión", line: {color: "#1f77b4", width: 2}}
+    ], {barmode: "stack", hovermode: "closest", xaxis: {title: "retorno log diario"}, yaxis: {title: "frecuencia"}}, 420);
+  };
+
+  const priceFigure = (tks, mode, logy, ma) => {
+    const data = [];
+    tks.forEach(t => {
+      const y = mode === "Base 100" ? prices[t].map(v => 100 * v / prices[t][0]) : prices[t];
+      data.push({x: dates, y, name: t, line: {width: 1.5}});
+      if (ma > 0) data.push({x: dates, y: y.map((_, i) => i + 1 < ma ? null : mean(y.slice(i + 1 - ma, i + 1))), name: `${t} · media ${ma}d`, line: {width: 1, dash: "dot"}});
+    });
+    return plot(data, {
+      yaxis: {type: logy ? "log" : "linear", title: mode === "Base 100" ? "Base 100" : "USD"},
+      xaxis: {rangeselector: {buttons: ranges}, rangeslider: {visible: true, thickness: 0.07}},
+      legend: {orientation: "h", y: 1.1}
+    }, 520);
+  };
+  const logret = t => prices[t].slice(1).map((v, i) => Math.log(v / prices[t][i]));
+  const volFigure = tks => plot(tks.map(t => {
+    const r = logret(t);
+    return {x: dates.slice(22), y: r.map((_, i) => i < 21 ? null : sd(r.slice(i - 20, i + 1)) * Math.sqrt(252)).slice(21), name: t, line: {width: 1.5}};
+  }), {yaxis: {title: "volatilidad anualizada", tickformat: ".0%"}, xaxis: {rangeselector: {buttons: ranges}}}, 380);
+  const retHist = t => {
+    const r = logret(t), m = mean(r), s = sd(r), bin = s / 4, lim = 6 * s, xs = Array.from({length: 241}, (_, i) => m - lim + i * lim / 120);
+    return plot([
+      {type: "histogram", x: r, xbins: {size: bin}, name: "Observado", marker: {color: "rgba(80,80,80,0.6)"}},
+      {x: xs, y: xs.map(v => r.length * bin * Math.exp(-0.5 * ((v - m) / s) ** 2) / (s * Math.sqrt(2 * Math.PI))), mode: "lines", name: "Normal", line: {color: "#1f77b4", width: 2}}
+    ], {hovermode: "closest", xaxis: {title: `retorno log diario — ${t}`}, yaxis: {title: "frecuencia"}}, 380);
+  };
+
+  return {dt, between, rng, fmt, table, calibAR, calibMerton, simMR, simMerton, simFigure, arFigure, retFigure, histFigure, priceFigure, volFigure, retHist};
+}
+```
+
+# Precio histórico
+
+## {.sidebar}
+
+```{ojs}
+viewof sP = Inputs.form({
+  tk: Inputs.checkbox(tickers, {label: "Tickers", value: [tickers[0]]}),
+  mode: Inputs.radio(["Precio", "Base 100"], {label: "Escala", value: "Precio"}),
+  log: Inputs.toggle({label: "Eje logarítmico", value: false}),
+  ma: Inputs.range([0, 250], {label: "Media móvil (días)", step: 10, value: 0})
+})
+```
+
+```{ojs}
+//| output: false
+selP = sP.tk.length ? sP.tk : [tickers[0]]
+```
+
+## Row
+
+```{ojs}
+//| title: "Precio de cierre ajustado (usa el selector de rango y el control inferior para fijar ventanas)"
+lib.priceFigure(selP, sP.mode, sP.log, sP.ma)
+```
+
+## Row
+
+```{ojs}
+//| title: "Volatilidad móvil de 21 días"
+//| width: 50%
+lib.volFigure(selP)
+```
+
+```{ojs}
+//| title: "Retornos log diarios vs. normal (primer ticker seleccionado): colas pesadas → saltos"
+//| width: 50%
+lib.retHist(selP[0])
+```
+
+# Vasicek
+
+## {.sidebar}
+
+**Calibración**
+
+```{ojs}
+viewof sV = Inputs.form({
+  ticker: Inputs.select(tickers, {label: "Ticker"}),
+  from: Inputs.date({label: "Calibrar desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
+  to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)}),
+  horizon: Inputs.range([20, 504], {label: "Horizonte (días)", step: 1, value: 252}),
+  n: Inputs.range([10, 1000], {label: "Trayectorias", step: 10, value: 200}),
+  seed: Inputs.number({label: "Semilla", value: 42, step: 1})
+})
+```
+
+```{ojs}
+//| output: false
+cV = {
+  const [i0, i1] = lib.between(sV.from, sV.to);
+  return {i0, i1, ...lib.calibAR(prices[sV.ticker].slice(i0, i1 + 1))};
+}
+```
+
+**Parámetros de la simulación** (arrancan en lo calibrado; muévelos para probar otras configuraciones)
+
+```{ojs}
+viewof pV = {
+  const pad = 0.5 * (cV.hi - cV.lo);
+  return Inputs.form({
+    kappa: Inputs.range([0.001, Math.max(3 * cV.kappa, 5)], {label: "κ (velocidad)", value: cV.kappa}),
+    theta: Inputs.range([Math.min(cV.level, cV.lo) - pad, Math.max(cV.level, cV.hi) + pad], {label: "θ (nivel)", value: cV.level}),
+    sigma: Inputs.range([0.1 * cV.sigma, 3 * cV.sigma], {label: "σ", value: cV.sigma})
+  });
+}
+```
+
+## Row
+
+Modelo: `dP = κ(θ − P)dt + σ dW` sobre el precio. **Calibración:** regresión MCO `Pₜ₊₁ = a + b·Pₜ + ε` sobre la ventana elegida; de ahí `κ = −ln(b)/Δt`, `θ = a/(1−b)`, `σ = s_ε·√(2κ/(1−b²))`. El punto verde es donde la recta ajustada corta la diagonal: el nivel de equilibrio θ. **Simulación:** esquema exacto del proceso desde el último precio de la ventana; si hay datos reales posteriores se dibujan en rojo para evaluar el ajuste fuera de muestra. Si `b ≥ 1` no hay reversión a la media y κ, θ no son identificables.
+
+## Row
+
+```{ojs}
+//| title: "Calibración: regresión Pₜ₊₁ sobre Pₜ"
+//| width: 65%
+lib.arFigure(cV, "Pₜ (USD)", "Pₜ₊₁ (USD)")
+```
+
+```{ojs}
+//| title: "Parámetros"
+//| width: 35%
+lib.table(["", "Calibrado", "Usado"], [
+  ["κ", lib.fmt(cV.kappa), lib.fmt(pV.kappa)],
+  ["θ", lib.fmt(cV.level), lib.fmt(pV.theta)],
+  ["σ", lib.fmt(cV.sigma), lib.fmt(pV.sigma)],
+  ["Vida media (días)", lib.fmt(Math.log(2) / cV.kappa * 252), lib.fmt(Math.log(2) / pV.kappa * 252)],
+  ["b (AR1)", lib.fmt(cV.b), ""],
+  ["R²", lib.fmt(cV.r2), ""],
+  ["Reversión", cV.reverting ? "sí" : "no (b ≥ 1)", ""]
+])
+```
+
+## Row
+
+```{ojs}
+//| title: "Simulación Monte Carlo vs. precio real"
+lib.simFigure({ticker: sV.ticker, i0: cV.i0, i1: cV.i1, level: pV.theta, levelName: "θ",
+  paths: lib.simMR(prices[sV.ticker][cV.i1], pV.kappa, pV.theta, pV.sigma, sV.horizon, sV.n, sV.seed)})
+```
+
+## Row
+
+```{python}
+#| title: "Referencia: calibración FinStoch (muestra completa, todos los tickers)"
+tabV
+```
+
+# Merton
+
+## {.sidebar}
+
+**Calibración**
+
+```{ojs}
+viewof sM = Inputs.form({
+  ticker: Inputs.select(tickers, {label: "Ticker"}),
+  from: Inputs.date({label: "Calibrar desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
+  to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)}),
+  k: Inputs.range([1.5, 6], {label: "Umbral de saltos (×σ)", step: 0.1, value: 3}),
+  horizon: Inputs.range([20, 504], {label: "Horizonte (días)", step: 1, value: 252}),
+  n: Inputs.range([10, 1000], {label: "Trayectorias", step: 10, value: 200}),
+  seed: Inputs.number({label: "Semilla", value: 42, step: 1})
+})
+```
+
+```{ojs}
+//| output: false
+cM = {
+  const [i0, i1] = lib.between(sM.from, sM.to);
+  return {i0, i1, ...lib.calibMerton(prices[sM.ticker].slice(i0, i1 + 1).map(v => Math.log(v)), sM.k)};
+}
+```
+
+**Parámetros de la simulación** (arrancan en lo calibrado)
+
+```{ojs}
+viewof pM = Inputs.form({
+  mu: Inputs.range([Math.min(-0.5, cM.mu - 0.2), Math.max(0.5, cM.mu + 0.2)], {label: "μ (deriva anual)", value: cM.mu}),
+  sigma: Inputs.range([0.01, Math.max(1, 2 * cM.sigma)], {label: "σ (difusión)", value: Math.max(cM.sigma, 0.01)}),
+  lambda: Inputs.range([0, Math.max(30, 2 * cM.lambda)], {label: "λ (saltos/año)", value: cM.lambda}),
+  muJ: Inputs.range([Math.min(-0.3, cM.muJ - 0.1), Math.max(0.3, cM.muJ + 0.1)], {label: "μ_J (salto medio)", value: cM.muJ}),
+  sigJ: Inputs.range([0.001, Math.max(0.2, 2 * cM.sigJ)], {label: "σ_J (dispersión)", value: Math.max(cM.sigJ, 0.001)})
+})
+```
+
+## Row
+
+Modelo: `dS/S = (μ − λk)dt + σ dW + (J − 1)dN`, con `N` Poisson de intensidad λ y `ln J ~ N(μ_J, σ_J²)`. **Calibración (detección de saltos):** se parte de la media y desviación de los retornos log; se marcan como saltos los retornos a más de `k·σ` de la media, se re-estiman media y σ sin ellos y se repite hasta converger. Con los saltos detectados: `λ = n_saltos / años`, `μ_J` y `σ_J` = media y desviación del tamaño de los saltos, `σ` = desviación de la parte difusiva (anualizada) y `μ` recupera la deriva incluyendo la compensación `λk`. Subir el umbral detecta menos saltos.
+
+## Row
+
+```{ojs}
+//| title: "Calibración: retornos log y umbral de saltos"
+//| width: 50%
+lib.retFigure(cM, cM.i0)
+```
+
+```{ojs}
+//| title: "Distribución: difusión + saltos vs. normal"
+//| width: 50%
+lib.histFigure(cM)
+```
+
+## Row
+
+```{ojs}
+//| title: "Parámetros"
+//| width: 35%
+lib.table(["", "Calibrado", "Usado"], [
+  ["μ", lib.fmt(cM.mu), lib.fmt(pM.mu)],
+  ["σ", lib.fmt(cM.sigma), lib.fmt(pM.sigma)],
+  ["λ", lib.fmt(cM.lambda), lib.fmt(pM.lambda)],
+  ["μ_J", lib.fmt(cM.muJ), lib.fmt(pM.muJ)],
+  ["σ_J", lib.fmt(cM.sigJ), lib.fmt(pM.sigJ)],
+  ["Saltos detectados", cM.nJ, ""],
+  ["Umbral diario (k·σ)", lib.fmt(cM.k * cM.s), ""]
+])
+```
+
+```{ojs}
+//| title: "Simulación Monte Carlo vs. precio real"
+//| width: 65%
+lib.simFigure({ticker: sM.ticker, i0: cM.i0, i1: cM.i1, level: null, levelName: "",
+  paths: lib.simMerton(Math.log(prices[sM.ticker][cM.i1]), pM, sM.horizon, sM.n, sM.seed)})
+```
+
+## Row
+
+```{python}
+#| title: "Referencia: calibración FinStoch (muestra completa, todos los tickers)"
+tabM
+```
+
+# Ornstein-Uhlenbeck
+
+## {.sidebar}
+
+**Calibración**
+
+```{ojs}
+viewof sO = Inputs.form({
+  ticker: Inputs.select(tickers, {label: "Ticker"}),
+  from: Inputs.date({label: "Calibrar desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
+  to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)}),
+  horizon: Inputs.range([20, 504], {label: "Horizonte (días)", step: 1, value: 252}),
+  n: Inputs.range([10, 1000], {label: "Trayectorias", step: 10, value: 200}),
+  seed: Inputs.number({label: "Semilla", value: 42, step: 1})
+})
+```
+
+```{ojs}
+//| output: false
+cO = {
+  const [i0, i1] = lib.between(sO.from, sO.to);
+  return {i0, i1, ...lib.calibAR(prices[sO.ticker].slice(i0, i1 + 1).map(v => Math.log(v)))};
+}
+```
+
+**Parámetros de la simulación** (arrancan en lo calibrado)
+
+```{ojs}
+viewof pO = Inputs.form({
+  theta: Inputs.range([0.001, Math.max(3 * cO.kappa, 5)], {label: "θ (velocidad)", value: cO.kappa}),
+  mu: Inputs.range([Math.min(cO.level, cO.lo) - 0.5, Math.max(cO.level, cO.hi) + 0.5], {label: "μ (nivel de ln P)", value: cO.level}),
+  sigma: Inputs.range([0.1 * cO.sigma, 3 * cO.sigma], {label: "σ", value: cO.sigma})
+})
+```
+
+## Row
+
+Modelo sobre el logaritmo del precio: `d ln P = θ(μ − ln P)dt + σ dW`, es decir, el precio nunca es negativo y revierte a `exp(μ)`. **Calibración:** regresión MCO `xₜ₊₁ = a + b·xₜ + ε` con `x = ln P`; `θ = −ln(b)/Δt`, `μ = a/(1−b)`, `σ = s_ε·√(2θ/(1−b²))`. **Simulación:** esquema exacto del proceso desde el último precio de la ventana, transformado con `exp`. En series con tendencia `b ≈ 1` y la reversión es débil o inexistente: la calibración lo muestra tal cual.
+
+## Row
+
+```{ojs}
+//| title: "Calibración: regresión ln Pₜ₊₁ sobre ln Pₜ"
+//| width: 65%
+lib.arFigure(cO, "ln Pₜ", "ln Pₜ₊₁")
+```
+
+```{ojs}
+//| title: "Parámetros"
+//| width: 35%
+lib.table(["", "Calibrado", "Usado"], [
+  ["θ (velocidad)", lib.fmt(cO.kappa), lib.fmt(pO.theta)],
+  ["μ (ln P)", lib.fmt(cO.level), lib.fmt(pO.mu)],
+  ["exp(μ) (USD)", lib.fmt(Math.exp(cO.level)), lib.fmt(Math.exp(pO.mu))],
+  ["σ", lib.fmt(cO.sigma), lib.fmt(pO.sigma)],
+  ["Vida media (días)", lib.fmt(Math.log(2) / cO.kappa * 252), lib.fmt(Math.log(2) / pO.theta * 252)],
+  ["b (AR1)", lib.fmt(cO.b), ""],
+  ["R²", lib.fmt(cO.r2), ""],
+  ["Reversión", cO.reverting ? "sí" : "no (b ≥ 1)", ""]
+])
+```
+
+## Row
+
+```{ojs}
+//| title: "Simulación Monte Carlo vs. precio real"
+lib.simFigure({ticker: sO.ticker, i0: cO.i0, i1: cO.i1, level: Math.exp(pO.mu), levelName: "exp(μ)",
+  paths: lib.simMR(Math.log(prices[sO.ticker][cO.i1]), pO.theta, pO.mu, pO.sigma, sO.horizon, sO.n, sO.seed, Math.exp)})
+```
+
+## Row
+
+```{python}
+#| title: "Referencia: calibración FinStoch sobre ln P (muestra completa, todos los tickers)"
+tabO
+```

@@ -1,0 +1,13 @@
+project:
+  type: default
+  output-dir: docs
+  render:
+    - dashboard.qmd
+
+execute:
+  freeze: true
+
+format:
+  dashboard:
+    theme: default
+    scrolling: true
