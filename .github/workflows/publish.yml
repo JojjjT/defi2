@@ -15,12 +15,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Register Jupyter kernel 'defi2'
+        run: python -m ipykernel install --user --name defi2 --display-name "defi2"
+
       - uses: quarto-dev/quarto-actions/setup@v2
-      - run: quarto render
+
+      - name: Render site
+        run: quarto render
+
       - uses: quarto-dev/quarto-actions/publish@v2
         with:
           target: gh-pages
