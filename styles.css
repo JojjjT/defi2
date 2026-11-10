@@ -1,0 +1,69 @@
+/* ===== Layout del dashboard =====
+   Quarto 1.7 genera las "Row" como columnas de un grid; aquí se fuerza el
+   orden correcto con flexbox: filas apiladas de arriba a abajo, y dentro de
+   cada fila las tarjetas lado a lado con los anchos de dashboard.qmd.
+   < 992 px: todo en una sola columna, en el mismo orden. */
+
+/* Tarjeta vacía que Quarto crea con las celdas de configuración (datos + OJS):
+   se oculta, pero sus scripts siguen funcionando. */
+.quarto-dashboard .quarto-dashboard-pages > .tab-content { display: block !important; }
+.quarto-dashboard .quarto-dashboard-pages > .tab-content > .card.cell { display: none !important; }
+
+/* Contenedor de la página: filas apiladas */
+.quarto-dashboard .dashboard-page .main > .sidebar-content > .bslib-grid {
+  display: flex !important;
+  flex-direction: column;
+  gap: 1rem;
+  height: auto !important;
+}
+/* Cada fila: tarjetas lado a lado */
+.quarto-dashboard .dashboard-page .main > .sidebar-content > .bslib-grid > .bslib-grid {
+  display: flex !important;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: stretch;
+  gap: 1rem;
+  height: auto !important;
+  flex: 0 0 auto;
+}
+.quarto-dashboard .dashboard-page .main .bslib-grid > .card {
+  flex: 1 1 0;
+  min-width: 0;
+  height: auto !important;
+  max-height: none !important;
+  overflow: visible;
+}
+.quarto-dashboard .dashboard-page .main .bslib-grid > .card[data-width="65%"] { flex: 0 0 calc(65% - .5rem); }
+.quarto-dashboard .dashboard-page .main .bslib-grid > .card[data-width="35%"] { flex: 0 0 calc(35% - .5rem); }
+.quarto-dashboard .dashboard-page .main .bslib-grid > .card[data-width="50%"] { flex: 0 0 calc(50% - .5rem); }
+
+/* Contenido de las tarjetas */
+.quarto-dashboard .card-body { flex: 1 1 auto; min-height: min-content; overflow: auto; }
+.quarto-dashboard .card.cell { min-height: 340px; }
+.quarto-dashboard .js-plotly-plot,
+.quarto-dashboard .plot-container { width: 100% !important; }
+.quarto-dashboard .card table { font-size: .85rem; margin-bottom: 0; }
+.quarto-dashboard .card table td,
+.quarto-dashboard .card table th { white-space: nowrap; }
+.quarto-dashboard .card[data-fill="false"] .card-body { line-height: 1.5; }
+
+/* Tablet y móvil: una columna */
+@media (max-width: 991.98px) {
+  .quarto-dashboard .dashboard-page .main > .sidebar-content > .bslib-grid > .bslib-grid {
+    flex-direction: column;
+  }
+  .quarto-dashboard .dashboard-page .main .bslib-grid > .card,
+  .quarto-dashboard .dashboard-page .main .bslib-grid > .card[data-width] {
+    flex: 0 0 auto !important;
+    width: 100% !important;
+  }
+}
+
+/* Móvil: más compacto */
+@media (max-width: 575.98px) {
+  .quarto-dashboard .dashboard-scrolling { padding: .5em; }
+  .quarto-dashboard .card-body { padding: .5rem; }
+  .quarto-dashboard .card-header { font-size: .9rem; }
+  .quarto-dashboard .card table { font-size: .78rem; }
+  .quarto-dashboard .card.cell { min-height: 300px; }
+}
