@@ -10,7 +10,7 @@ Cada página incluye además la calibración de referencia de FinStoch (muestra 
 ## Uso local
 
 ```bash
-git clone https://github.com/<usuario>/defi2-dashboard.git
+git clone https://github.com/JojjjT/defi2-dashboard.git
 cd defi2-dashboard
 pip install -r requirements.txt
 python download_data.py
