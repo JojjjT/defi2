@@ -15,12 +15,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Registrar el kernel (sirve para jupyter python3 y para defi2)
+        run: |
+          python -m ipykernel install --user --name python3
+          python -m ipykernel install --user --name defi2
+
+      - name: Descargar precios
+        run: |
+          mkdir -p data
+          python download_data.py
+
       - uses: quarto-dev/quarto-actions/setup@v2
-      - run: quarto render
+
       - uses: quarto-dev/quarto-actions/publish@v2
         with:
           target: gh-pages
