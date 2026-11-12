@@ -66,7 +66,7 @@ lib = {
     const u = () => { a = (a + 0x6D2B79F5) >>> 0; let t = Math.imul(a ^ (a >>> 15), a | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
     const z = () => Math.sqrt(-2 * Math.log(1 - u())) * Math.cos(2 * Math.PI * u());
     const pois = l => { const L = Math.exp(-l); let k = 0, p = u(); while (p > L) { k++; p *= u(); } return k; };
-    return {z, pois};
+    return {u, z, pois};
   };
   const fmt = x => !isFinite(x) ? "—" : (x !== 0 && (Math.abs(x) >= 1e5 || Math.abs(x) < 1e-3)) ? x.toExponential(2) : x.toFixed(4);
   const ranges = [1, 3, 6].map(m => ({count: m, label: `${m}m`, step: "month", stepmode: "backward"}))
@@ -81,7 +81,7 @@ lib = {
       if (!div.clientWidth) return;               // pestaña oculta o aún sin ancho: se dibuja al tener tamaño
       if (!drawn) {
         drawn = true;
-        Plotly.newPlot(div, data, {height: calcH(), margin: {l: 55, r: 15, t: 20, b: 40}, hovermode: "x unified", legend: {orientation: "h", y: -0.15}, ...layout}, {responsive: true, displaylogo: false});
+        Plotly.newPlot(div, data, {height: calcH(), margin: {l: 55, r: 15, t: 20, b: 95}, hovermode: "x unified", legend: {orientation: "h", yanchor: "top", y: -0.3}, ...layout}, {responsive: true, displaylogo: false});
       } else Plotly.relayout(div, {autosize: true, height: calcH()});
     };
     if (window.ResizeObserver) new ResizeObserver(render).observe(div);
@@ -233,7 +233,723 @@ lib = {
     ], {hovermode: "closest", xaxis: {title: `retorno log diario — ${t}`}, yaxis: {title: "frecuencia"}}, 380);
   };
 
-  return {dt, between, rng, fmt, table, calibAR, calibMerton, simMR, simMerton, simFigure, arFigure, retFigure, histFigure, priceFigure, volFigure, retHist};
+  return {dt, between, rng, fmt, table, plot, ranges, mean, sd, sum, quantile, bdays, fan, iso, calibAR, calibMerton, simMR, simMerton, simFigure, arFigure, retFigure, histFigure, priceFigure, volFigure, retHist};
+}
+```
+
+```{ojs}
+//| output: false
+lib2 = {
+  const {dt, plot, table, fmt, mean, sd, sum, quantile, rng, ranges, bdays, iso} = lib;
+  const nn = a => a.map(v => isFinite(v) ? v : null);
+  const grid = (a, b, n) => Array.from({length: n}, (_, i) => a + (b - a) * i / (n - 1));
+  const npdf = (x, m, s) => Math.exp(-0.5 * ((x - m) / s) ** 2) / (s * Math.sqrt(2 * Math.PI));
+  const moments = a => { const m = mean(a), s = sd(a), n = a.length; return {m, s, skew: sum(a.map(x => ((x - m) / s) ** 3)) / n, kurt: sum(a.map(x => ((x - m) / s) ** 4)) / n - 3}; };
+
+  // ---------- Black-Scholes, Merton (1976) y volatilidad implícita ----------
+  const erf = z => {
+    const a = Math.abs(z);
+    if (a < 3) { let s = 0, t = a; for (let n = 0; n < 80; n++) { s += t / (2 * n + 1); t *= -a * a / (n + 1); } return Math.sign(z) * 2 / Math.sqrt(Math.PI) * s; }
+    const e = Math.exp(-a * a) / (a * Math.sqrt(Math.PI)) * (1 - 1 / (2 * a * a) + 3 / (4 * a ** 4) - 15 / (8 * a ** 6));
+    return Math.sign(z) * (1 - e);
+  };
+  const cnd = x => 0.5 * (1 + erf(x / Math.SQRT2));
+  const bs = (S, K, T, r, s, call = true, q = 0) => {
+    const d1 = (Math.log(S / K) + (r - q + s * s / 2) * T) / (s * Math.sqrt(T)), d2 = d1 - s * Math.sqrt(T);
+    return call ? S * Math.exp(-q * T) * cnd(d1) - K * Math.exp(-r * T) * cnd(d2) : K * Math.exp(-r * T) * cnd(-d2) - S * Math.exp(-q * T) * cnd(-d1);
+  };
+  const iv = (price, S, K, T, r, call) => {
+    let lo = 1e-4, hi = 5;
+    if (!(price > bs(S, K, T, r, lo, call) + 1e-10 && price < bs(S, K, T, r, hi, call))) return null;
+    for (let i = 0; i < 70; i++) { const m = (lo + hi) / 2; if (bs(S, K, T, r, m, call) > price) hi = m; else lo = m; }
+    return (lo + hi) / 2;
+  };
+  const lf = [0]; for (let i = 1; i < 400; i++) lf.push(lf[i - 1] + Math.log(i));
+  const mertonCall = (S, K, T, r, q) => {
+    const k = Math.exp(q.muJ + q.sigJ ** 2 / 2) - 1, lp = q.lambda * (1 + k), lt = lp * T;
+    if (lt <= 0) return bs(S, K, T, r, q.sigma, true);
+    let c = 0;
+    for (let n = 0, nmax = Math.min(390, Math.ceil(lt + 10 * Math.sqrt(lt) + 20)); n <= nmax; n++)
+      c += Math.exp(-lt + (n ? n * Math.log(lt) : 0) - lf[n]) * bs(S, K, T, r - q.lambda * k + n * (q.muJ + q.sigJ ** 2 / 2) / T, Math.sqrt(q.sigma ** 2 + n * q.sigJ ** 2 / T), true);
+    return c;
+  };
+  const smile = (S, T, r, ms, callPrice) => ms.map(m => {
+    const K = S * m, c = callPrice(K), call = K >= S * Math.exp(r * T);
+    return iv(call ? c : c - S + K * Math.exp(-r * T), S, K, T, r, call);
+  });
+  const smileFigure = ({S, T, r, curves, flat}) => {
+    const ms = grid(0.7, 1.3, 25);
+    const data = curves.map(c => ({x: ms, y: smile(S, T, r, ms, K => mertonCall(S, K, T, r, c.q)), name: c.name, line: c.line}));
+    data.push({x: [0.7, 1.3], y: [flat, flat], name: "Black-Scholes (σ difusiva)", line: {color: "black", dash: "dash", width: 1}});
+    return plot(data, {xaxis: {title: "Moneyness K/S₀"}, yaxis: {title: "Volatilidad implícita", tickformat: ".0%"}}, 420);
+  };
+
+  // ---------- Diagnósticos de calibración AR(1) ----------
+  const residuals = c => c.Y.map((y, i) => y - c.a - c.b * c.X[i]);
+  const resHist = c => {
+    const e = residuals(c), s = sd(e), bin = s / 4, lim = 4.5 * s, xs = grid(-lim, lim, 181);
+    return plot([
+      {type: "histogram", x: e, xbins: {size: bin}, name: "Residuos", marker: {color: "rgba(80,80,80,0.6)"}},
+      {x: xs, y: xs.map(v => e.length * bin * npdf(v, 0, s)), mode: "lines", name: "Normal", line: {color: "#1f77b4", width: 2}}
+    ], {hovermode: "closest", xaxis: {title: "residuo εₜ"}, yaxis: {title: "frecuencia"}}, 380);
+  };
+  const acfFigure = c => {
+    const e = residuals(c), m = mean(e), den = sum(e.map(v => (v - m) ** 2)), L = 20, band = 1.96 / Math.sqrt(e.length);
+    const r = Array.from({length: L}, (_, k) => sum(e.slice(k + 1).map((v, i) => (v - m) * (e[i] - m))) / den);
+    return plot([
+      {type: "bar", x: Array.from({length: L}, (_, k) => k + 1), y: r, name: "ACF de residuos", marker: {color: "rgba(80,80,80,0.7)"}},
+      {x: [0.5, L + 0.5], y: [band, band], mode: "lines", name: "±1,96/√n", line: {color: "#d62728", dash: "dash", width: 1}},
+      {x: [0.5, L + 0.5], y: [-band, -band], mode: "lines", showlegend: false, line: {color: "#d62728", dash: "dash", width: 1}}
+    ], {xaxis: {title: "rezago"}, yaxis: {title: "autocorrelación"}}, 380);
+  };
+
+  // ---------- Específicas: Vasicek / OU ----------
+  const meanCurves = ({ticker, i1, x0, level, kappa, steps, tf, label}) => {
+    const fut = bdays(dates[i1], steps), h = prices[ticker], a = Math.max(0, i1 - 252);
+    const data = [
+      {x: dates.slice(a, i1 + 1), y: h.slice(a, i1 + 1), name: "Real", line: {color: "black", width: 1.5}},
+      {x: dates.slice(i1), y: h.slice(i1), name: "Real (posterior)", line: {color: "#d62728", width: 1.5}}
+    ];
+    [0.25, 0.5, 1, 2, 4].forEach(m => data.push({x: fut, y: fut.map((_, i) => tf(level + (x0 - level) * Math.exp(-m * kappa * i * dt))), name: `${label}×${m}`, line: {width: m === 1 ? 3 : 1.5, dash: m === 1 ? "solid" : "dot"}}));
+    return plot(data, {yaxis: {title: "USD"}}, 420);
+  };
+  const termDist = (paths, pdf, xlabel, name) => {
+    const T = Array.from(paths, p => p[p.length - 1]), s = Float64Array.from(T).sort();
+    const lo = quantile(s, 0.002), hi = quantile(s, 0.998), xs = grid(lo, hi, 200);
+    return plot([
+      {type: "histogram", x: T, histnorm: "probability density", nbinsx: 50, name: "Monte Carlo", marker: {color: "rgba(80,80,80,0.6)"}},
+      {x: xs, y: xs.map(pdf), mode: "lines", name, line: {color: "#1f77b4", width: 2}}
+    ], {hovermode: "closest", xaxis: {title: xlabel, range: [lo, hi]}, yaxis: {title: "densidad"}}, 420);
+  };
+  const passage = (paths, level, kappa) => {
+    const steps = paths[0].length, side = Math.sign(paths[0][0] - level) || 1;
+    const first = paths.map(p => { for (let i = 1; i < steps; i++) if ((p[i] - level) * side <= 0) return i; return Infinity; });
+    const cdf = Array.from({length: steps}, (_, i) => first.filter(f => f <= i).length / paths.length);
+    const shapes = [], hl = Math.log(2) / kappa * 252;
+    if (hl < steps) shapes.push({type: "line", x0: hl, x1: hl, yref: "paper", y0: 0, y1: 1, line: {color: "green", dash: "dash", width: 1}});
+    return plot([{x: cdf.map((_, i) => i), y: cdf, name: "P(haber cruzado el nivel)", line: {color: "#1f77b4", width: 2}}],
+      {xaxis: {title: "días desde el inicio de la simulación"}, yaxis: {title: "probabilidad acumulada", range: [0, 1]}, shapes,
+       annotations: hl < steps ? [{x: hl, y: 1, yref: "paper", text: "vida media", showarrow: false, xanchor: "left", yanchor: "top"}] : []}, 420);
+  };
+
+  // ---------- Específicas: Merton ----------
+  const mertonDecomp = ({ticker, i1}, q, steps, seed) => {
+    const R = rng(seed), S0 = prices[ticker][i1], kk = Math.exp(q.muJ + q.sigJ ** 2 / 2) - 1;
+    const drift = (q.mu - q.sigma ** 2 / 2 - q.lambda * kk) * dt, vol = q.sigma * Math.sqrt(dt), fut = bdays(dates[i1], steps);
+    let xd = 0, xj = 0; const P = [S0], D = [S0], jx = [], jy = [], jt = [];
+    for (let i = 0; i < steps; i++) {
+      const N = R.pois(q.lambda * dt); xd += drift + vol * R.z();
+      const js = N ? N * q.muJ + Math.sqrt(N) * q.sigJ * R.z() : 0; xj += js;
+      P.push(S0 * Math.exp(xd + xj)); D.push(S0 * Math.exp(xd));
+      if (N) { jx.push(fut[i + 1]); jy.push(P[i + 1]); jt.push(`salto ${(100 * (Math.exp(js) - 1)).toFixed(1)}%`); }
+    }
+    return plot([
+      {x: fut, y: D, name: "Solo difusión", line: {color: "rgba(80,80,80,0.8)", width: 1.5}},
+      {x: fut, y: P, name: "Difusión + saltos", line: {color: "#1f77b4", width: 2}},
+      {x: jx, y: jy, mode: "markers", name: `Saltos (${jx.length})`, text: jt, hoverinfo: "text+x", marker: {size: 9, color: "#d62728"}}
+    ], {yaxis: {title: "USD"}}, 420);
+  };
+  const jumpSizes = (c, q) => {
+    const J = c.r.filter((_, i) => c.jump[i]).map(x => x - c.m), bin = 0.01, xs = grid(-0.3, 0.3, 241);
+    return plot([
+      {type: "histogram", x: J, xbins: {size: bin}, name: `Saltos detectados (${J.length})`, marker: {color: "#d62728"}},
+      {x: xs, y: xs.map(v => J.length * bin * npdf(v, q.muJ, q.sigJ)), mode: "lines", name: "N(μ_J, σ_J) usado", line: {color: "#1f77b4", width: 2}}
+    ], {hovermode: "closest", xaxis: {title: "tamaño del salto (log)"}, yaxis: {title: "frecuencia"}}, 420);
+  };
+
+  // ---------- Herding en activos: CSAD de Chang, Cheng y Khorana (2000) ----------
+  const inv = A => {
+    const n = A.length, M = A.map((r, i) => [...r, ...Array.from({length: n}, (_, j) => +(i === j))]);
+    for (let c = 0; c < n; c++) {
+      let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+      [M[c], M[p]] = [M[p], M[c]];
+      const d = M[c][c]; for (let j = 0; j < 2 * n; j++) M[c][j] /= d;
+      for (let r = 0; r < n; r++) if (r !== c) { const f = M[r][c]; for (let j = 0; j < 2 * n; j++) M[r][j] -= f * M[c][j]; }
+    }
+    return M.map(r => r.slice(n));
+  };
+  const ols = (X, y, L = 5) => {
+    const n = y.length, k = X[0].length, z = () => Array.from({length: k}, () => new Array(k).fill(0));
+    const XtX = z(), Xty = new Array(k).fill(0);
+    for (let t = 0; t < n; t++) for (let a = 0; a < k; a++) { Xty[a] += X[t][a] * y[t]; for (let b = 0; b < k; b++) XtX[a][b] += X[t][a] * X[t][b]; }
+    const I = inv(XtX), beta = I.map(row => sum(row.map((v, j) => v * Xty[j])));
+    const e = y.map((v, t) => { let f = 0; for (let a = 0; a < k; a++) f += X[t][a] * beta[a]; return v - f; });
+    const S = z();
+    for (let l = 0; l <= L; l++) {
+      const w = l === 0 ? 1 : 1 - l / (L + 1);
+      for (let t = l; t < n; t++) { const g = w * e[t] * e[t - l];
+        for (let a = 0; a < k; a++) for (let b = 0; b < k; b++) { const v = g * X[t][a] * X[t - l][b]; S[a][b] += v; if (l > 0) S[b][a] += v; } }
+    }
+    const cov = I.map((_, a) => I.map((__, b) => { let s = 0; for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) s += I[a][i] * S[i][j] * I[j][b]; return s; }));
+    const my = mean(y), sst = sum(y.map(v => (v - my) ** 2));
+    return {beta, t: beta.map((b, i) => b / Math.sqrt(cov[i][i])), r2: 1 - sum(e.map(v => v * v)) / sst, n};
+  };
+  const csadSeries = (tks, i0, i1) => {
+    const T = i1 - i0, N = tks.length;
+    const R = tks.map(t => Array.from({length: T}, (_, j) => Math.log(prices[t][i0 + 1 + j] / prices[t][i0 + j])));
+    const rm = [], cs = [];
+    for (let t = 0; t < T; t++) {
+      let m = 0; for (let i = 0; i < N; i++) m += R[i][t]; m /= N;
+      let c = 0; for (let i = 0; i < N; i++) c += Math.abs(R[i][t] - m);
+      rm.push(m); cs.push(c / N);
+    }
+    return {R, rm, cs, T, N, x: dates.slice(i0 + 1, i1 + 1)};
+  };
+  const cckX = rm => rm.map(m => [1, Math.abs(m), m * m]);
+  const herdFit = s => {
+    const pick = f => { const idx = s.rm.map((_, i) => i).filter(i => f(s.rm[i])); return ols(cckX(idx.map(i => s.rm[i])), idx.map(i => s.cs[i])); };
+    const sorted = Float64Array.from(s.rm).sort(), lo = quantile(sorted, 0.05), hi = quantile(sorted, 0.95);
+    const ext = ols(s.rm.map(m => [1, +(m <= lo), +(m >= hi)]), s.cs);
+    return {all: ols(cckX(s.rm), s.cs), up: pick(m => m > 0), down: pick(m => m < 0), lin: ols(s.rm.map(m => [1, Math.abs(m)]), s.cs), ext, lo, hi};
+  };
+  const herdTables = f => {
+    const row = (n, o) => [n, fmt(o.beta[0]), `${fmt(o.beta[1])} (${o.t[1].toFixed(2)})`, `${fmt(o.beta[2])} (${o.t[2].toFixed(2)})`, o.r2.toFixed(3), o.n, o.t[2] < -1.645 ? "sí" : "no"];
+    const d = document.createElement("div");
+    d.append(table(["Muestra", "α", "γ₁ (t)", "γ₂ (t)", "R²", "n", "Manada"], [row("Todos los días", f.all), row("Mercado al alza", f.up), row("Mercado a la baja", f.down)]));
+    d.append(table(["Días extremos (5%)", "α", "β inferior (t)", "β superior (t)", "R²", "Manada"],
+      [["CSAD", fmt(f.ext.beta[0]), `${fmt(f.ext.beta[1])} (${f.ext.t[1].toFixed(2)})`, `${fmt(f.ext.beta[2])} (${f.ext.t[2].toFixed(2)})`, f.ext.r2.toFixed(3), f.ext.t[1] < -1.645 && f.ext.t[2] < -1.645 ? "sí" : "no"]]));
+    return d;
+  };
+  const herdScatter = (s, f) => {
+    const lim = Math.max(...s.rm.map(Math.abs)), xs = grid(-lim, lim, 121), b = f.all.beta, l = f.lin.beta;
+    return plot([
+      {x: s.rm, y: s.cs, mode: "markers", name: "Días", marker: {size: 4, color: "rgba(80,80,80,0.5)"}},
+      {x: xs, y: xs.map(m => b[0] + b[1] * Math.abs(m) + b[2] * m * m), mode: "lines", name: "Ajuste CCK (cuadrático)", line: {color: "#d62728", width: 2}},
+      {x: xs, y: xs.map(m => l[0] + l[1] * Math.abs(m)), mode: "lines", name: "Benchmark lineal (sin manada)", line: {color: "black", dash: "dash", width: 1}}
+    ], {hovermode: "closest", xaxis: {title: "retorno del mercado Rₘ (equiponderado)", tickformat: ".1%"}, yaxis: {title: "CSAD", tickformat: ".1%"},
+        annotations: [{xref: "paper", yref: "paper", x: 0.02, y: 0.98, xanchor: "left", yanchor: "top", showarrow: false, bgcolor: "white",
+          text: `CSAD = ${b[0].toFixed(4)} + ${b[1].toFixed(3)}|Rₘ| ${b[2] < 0 ? "−" : "+"} ${Math.abs(b[2]).toFixed(2)}Rₘ²<br>γ₂ t = ${f.all.t[2].toFixed(2)} → ${f.all.t[2] < -1.645 ? "evidencia de manada" : "sin evidencia"}`}]}, 440);
+  };
+  const herdRolling = (s, W) => {
+    const x = [], g = [], tt = [];
+    for (let e = W - 1; e < s.T; e++) { const o = ols(cckX(s.rm.slice(e - W + 1, e + 1)), s.cs.slice(e - W + 1, e + 1), 3); x.push(s.x[e]); g.push(o.beta[2]); tt.push(o.t[2]); }
+    return plot([
+      {x, y: g, name: "γ₂ móvil", line: {color: "#1f77b4", width: 1.5}},
+      {x: x.filter((_, i) => tt[i] < -1.645), y: g.filter((_, i) => tt[i] < -1.645), mode: "markers", name: "γ₂ < 0 significativo (t < −1,645)", marker: {size: 5, color: "#d62728"}},
+      {x: [x[0], x[x.length - 1]], y: [0, 0], name: "γ₂ = 0", line: {color: "black", dash: "dash", width: 1}}
+    ], {yaxis: {title: "γ₂"}, xaxis: {rangeselector: {buttons: ranges}}}, 420);
+  };
+  const herdCorr = (s, W) => {
+    const x = [], cr = [], cm = [];
+    for (let e = W - 1; e < s.T; e++) {
+      let tot = 0, cnt = 0;
+      for (let i = 0; i < s.N; i++) for (let j = i + 1; j < s.N; j++) {
+        const a = s.R[i].slice(e - W + 1, e + 1), b = s.R[j].slice(e - W + 1, e + 1), ma = mean(a), mb = mean(b);
+        let sab = 0, saa = 0, sbb = 0; for (let t = 0; t < W; t++) { sab += (a[t] - ma) * (b[t] - mb); saa += (a[t] - ma) ** 2; sbb += (b[t] - mb) ** 2; }
+        tot += sab / Math.sqrt(saa * sbb); cnt++;
+      }
+      x.push(s.x[e]); cr.push(tot / cnt); cm.push(mean(s.cs.slice(e - W + 1, e + 1)));
+    }
+    return plot([
+      {x, y: cm, name: "CSAD medio móvil", line: {color: "#1f77b4", width: 1.5}},
+      {x, y: cr, name: "Correlación media entre activos", yaxis: "y2", line: {color: "#d62728", width: 1.5}}
+    ], {yaxis: {title: "CSAD", tickformat: ".1%"}, yaxis2: {title: "correlación", overlaying: "y", side: "right", range: [0, 1]}, xaxis: {rangeselector: {buttons: ranges}}}, 420);
+  };
+
+  // ---------- Herding en opciones: modelo de Kirman (hormigas) + valoración Monte Carlo ----------
+  const binom = (n, p, R) => {
+    if (n <= 0 || p <= 0) return 0; if (p >= 1) return n;
+    if (n < 30) { let c = 0; for (let i = 0; i < n; i++) if (R.u() < p) c++; return c; }
+    return Math.max(0, Math.min(n, Math.round(n * p + Math.sqrt(n * p * (1 - p)) * R.z())));
+  };
+  const simHerd = (S0, q, steps, n, seed) => {
+    const R = rng(seed), d = 1 / 252, paths = [], xs = [], xa = [];
+    for (let j = 0; j < n; j++) {
+      let k = Math.round(q.N / 2); const p = new Float64Array(steps + 1), x = new Float64Array(steps + 1);
+      p[0] = S0; x[0] = k / q.N;
+      for (let i = 0; i < steps; i++) {
+        const xi = k / q.N, up = binom(q.N - k, Math.min(1, q.eps + q.h * xi), R), dn = binom(k, Math.min(1, q.eps + q.h * (1 - xi)), R);
+        k += up - dn;
+        const m = 2 * k / q.N - 1, s = q.sigma * (1 + q.kappa * Math.abs(m));
+        p[i + 1] = p[i] * Math.exp((q.r + q.beta * m - 0.5 * s * s) * d + s * Math.sqrt(d) * R.z());
+        x[i + 1] = k / q.N;
+      }
+      paths.push(p); xa.push(x); if (j < 6) xs.push(x);
+    }
+    return {paths, xs, xa};
+  };
+  const statX = (q, seed) => {
+    const R = rng(seed + 1), out = []; let k = Math.round(q.N / 2);
+    for (let i = 0; i < 40000; i++) {
+      const xi = k / q.N; k += binom(q.N - k, Math.min(1, q.eps + q.h * xi), R) - binom(k, Math.min(1, q.eps + q.h * (1 - xi)), R);
+      if (i > 2000 && i % 5 === 0) out.push(k / q.N);
+    }
+    return out;
+  };
+  const lgamma = z => {
+    const c = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7];
+    if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - lgamma(1 - z);
+    z -= 1; let x = c[0]; for (let i = 1; i < 9; i++) x += c[i] / (z + i);
+    const t = z + 7.5; return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
+  };
+  const herdX = xs => plot(xs.map((x, i) => ({x: Array.from(x, (_, t) => t), y: Array.from(x), name: `Trayectoria ${i + 1}`, line: {width: 1.2}})),
+    {xaxis: {title: "días"}, yaxis: {title: "fracción de optimistas xₜ", range: [0, 1]}, shapes: [{type: "line", xref: "paper", x0: 0, x1: 1, y0: 0.5, y1: 0.5, line: {color: "black", dash: "dash", width: 1}}]}, 420);
+  const herdStat = (q) => {
+    const xs = statX(q, 7), a = q.N * q.eps / q.h, g = grid(0.005, 0.995, 199);
+    return plot([
+      {type: "histogram", x: xs, histnorm: "probability density", xbins: {start: 0, end: 1, size: 0.02}, name: "Simulado (largo plazo)", marker: {color: "rgba(80,80,80,0.6)"}},
+      {x: g, y: g.map(v => Math.min(10, Math.exp(lgamma(2 * a) - 2 * lgamma(a) + (a - 1) * Math.log(v * (1 - v))))), mode: "lines", name: `Beta(${a.toFixed(2)}, ${a.toFixed(2)})`, line: {color: "#1f77b4", width: 2}}
+    ], {hovermode: "closest", xaxis: {title: "fracción de optimistas x", range: [0, 1]}, yaxis: {title: "densidad"}}, 420);
+  };
+  const herdRet = (paths, S0) => {
+    const r = Array.from(paths, p => Math.log(p[p.length - 1] / S0)), mo = moments(r), bin = mo.s / 5, xs = grid(mo.m - 4.5 * mo.s, mo.m + 4.5 * mo.s, 181);
+    return plot([
+      {type: "histogram", x: r, xbins: {size: bin}, name: "Retorno terminal simulado", marker: {color: "rgba(80,80,80,0.6)"}},
+      {x: xs, y: xs.map(v => r.length * bin * npdf(v, mo.m, mo.s)), mode: "lines", name: "Normal", line: {color: "#1f77b4", width: 2}}
+    ], {hovermode: "closest", xaxis: {title: "ln(Sₜ/S₀)"}, yaxis: {title: "frecuencia"},
+        annotations: [{xref: "paper", yref: "paper", x: 0.98, y: 0.98, xanchor: "right", yanchor: "top", showarrow: false, bgcolor: "white",
+          text: `asimetría = ${mo.skew.toFixed(2)}<br>curtosis exceso = ${mo.kurt.toFixed(2)}`}]}, 420);
+  };
+  const herdPrices = (paths, S0, T, r, sigma) => {
+    const F = S0 * Math.exp(r * T), ST = Float64Array.from(paths, p => p[p.length - 1]), adj = F / mean(ST);
+    const price = (K, call) => Math.exp(-r * T) * mean(ST.map(v => Math.max(call ? v * adj - K : K - v * adj, 0)));
+    const ms = grid(0.75, 1.25, 21);
+    const ivs = ms.map(m => { const K = S0 * m, call = K >= F; return iv(price(K, call), S0, K, T, r, call); });
+    return {price, ms, ivs, F, adj};
+  };
+  const herdSmile = (hp, sigma) => plot([
+    {x: hp.ms, y: hp.ivs, name: "Con manada (Monte Carlo)", line: {color: "#1f77b4", width: 2}},
+    {x: [hp.ms[0], hp.ms.at(-1)], y: [sigma, sigma], name: "Black-Scholes (σ base)", line: {color: "black", dash: "dash", width: 1}}
+  ], {xaxis: {title: "Moneyness K/S₀"}, yaxis: {title: "Volatilidad implícita", tickformat: ".0%"}}, 420);
+  const herdOptTable = (hp, S0, T, r, sigma) => table(["K/S₀", "K", "Call MC", "Put MC", "Call BS", "Vol. implícita"],
+    [0.8, 0.9, 1, 1.1, 1.2].map(m => { const K = S0 * m, call = K >= hp.F, v = iv(hp.price(K, call), S0, K, T, r, call);
+      return [m.toFixed(2), fmt(K), fmt(hp.price(K, true)), fmt(hp.price(K, false)), fmt(bs(S0, K, T, r, sigma, true)), v == null ? "—" : (100 * v).toFixed(1) + "%"]; }));
+
+  // ---------- Opciones reales: retículo binomial CRR ----------
+  const lattice = (kind, V0, K, f, T, r, d, s, N) => {
+    const h = T / N, u = Math.exp(s * Math.sqrt(h)), dn = 1 / u;
+    const p = Math.min(1, Math.max(0, (Math.exp((r - d) * h) - dn) / (u - dn))), disc = Math.exp(-r * h);
+    const pay = V => kind === "defer" ? Math.max(V - K, 0) : kind === "expand" ? Math.max((f - 1) * V - K, 0) : Math.max(K - V, 0);
+    const Vn = (i, j) => V0 * Math.exp((2 * j - i) * s * Math.sqrt(h));
+    const val = [], flag = [];
+    val[N] = Array.from({length: N + 1}, (_, j) => pay(Vn(N, j))); flag[N] = val[N].map(v => v > 0);
+    for (let i = N - 1; i >= 0; i--) {
+      val[i] = []; flag[i] = [];
+      for (let j = 0; j <= i; j++) { const c = disc * (p * val[i + 1][j + 1] + (1 - p) * val[i + 1][j]), e = pay(Vn(i, j)); flag[i][j] = e > c + 1e-12; val[i][j] = Math.max(c, e); }
+    }
+    return {value: val[0][0], val, flag, Vn, h, p, pay};
+  };
+  const realStatic = (kind, V, K) => kind === "defer" ? V - K : V;
+  const realFlex = (kind, V, opt, K) => kind === "defer" ? opt : V + opt;
+  const critical = (kind, q) => {
+    const ref = Math.max(q.V0, q.K), at = V => lattice(kind, V, q.K, q.f, q.T, q.r, q.d, q.s, q.N).flag[0][0];
+    const g = grid(0.2 * ref, 3 * ref, 150), ex = g.map(at);
+    let i = kind === "abandon" ? ex.lastIndexOf(true) : ex.indexOf(true);
+    if (i < 0) return null;
+    let a = kind === "abandon" ? g[i] : g[Math.max(i - 1, 0)], b = kind === "abandon" ? g[Math.min(i + 1, g.length - 1)] : g[i];
+    for (let it = 0; it < 25; it++) { const m = (a + b) / 2; if ((at(m) === true) === (kind !== "abandon")) b = m; else a = m; }
+    return (a + b) / 2;
+  };
+  const msThreshold = (K, r, d, s) => {
+    const m = (r - d) / (s * s) - 0.5, beta = -m + Math.sqrt(m * m + 2 * r / (s * s));
+    return beta > 1 + 1e-9 ? beta / (beta - 1) * K : Infinity;
+  };
+  const kindName = {defer: "Diferir (call americana)", expand: "Expandir", abandon: "Abandonar (put americana)"};
+  const realCurves = (kind, q, vstar) => {
+    const ref = Math.max(q.V0, q.K), Vs = grid(0.2 * ref, 2.2 * ref, 70);
+    const opt = Vs.map(V => lattice(kind, V, q.K, q.f, q.T, q.r, q.d, q.s, q.N).value);
+    const shapes = [{type: "line", x0: q.V0, x1: q.V0, yref: "paper", y0: 0, y1: 1, line: {color: "black", dash: "dot", width: 1}}];
+    if (vstar != null) shapes.push({type: "line", x0: vstar, x1: vstar, yref: "paper", y0: 0, y1: 1, line: {color: "green", dash: "dash", width: 1}});
+    return plot([
+      {x: Vs, y: Vs.map(V => realStatic(kind, V, q.K)), name: kind === "defer" ? "VPN estático (V − K)" : "Proyecto sin flexibilidad (V)", line: {color: "black", width: 1.5}},
+      {x: Vs, y: Vs.map((V, i) => realFlex(kind, V, opt[i], q.K)), name: "Valor con la opción real", line: {color: "#1f77b4", width: 2.5}},
+      {x: Vs, y: opt, name: "Valor de la opción", line: {color: "#d62728", width: 1.5, dash: "dot"}}
+    ], {xaxis: {title: "Valor presente de los flujos V"}, yaxis: {title: "valor"}, shapes,
+        annotations: [{x: q.V0, y: 1, yref: "paper", text: "V₀", showarrow: false, xanchor: "left", yanchor: "top"}].concat(vstar != null ? [{x: vstar, y: 0.9, yref: "paper", text: "V*", showarrow: false, xanchor: "left", yanchor: "top"}] : [])}, 440);
+  };
+  const realLattice = (kind, q) => {
+    const L = lattice(kind, q.V0, q.K, q.f, q.T, q.r, q.d, q.s, q.N), M = Math.min(q.N, 24), nx = [], ny = [], ex = {x: [], y: [], text: []}, co = {x: [], y: [], text: []}, ex2 = [];
+    for (let i = 0; i <= M; i++) for (let j = 0; j <= i; j++) {
+      const t = i * L.h, V = L.Vn(i, j), txt = `t=${t.toFixed(2)} · V=${V.toFixed(1)}<br>valor opción=${L.val[i][j].toFixed(2)}`;
+      (L.flag[i][j] ? ex : co).x.push(t); (L.flag[i][j] ? ex : co).y.push(V); (L.flag[i][j] ? ex : co).text.push(txt);
+      if (i < M) { nx.push(t, t + L.h, null, t, t + L.h, null); ny.push(V, L.Vn(i + 1, j + 1), null, V, L.Vn(i + 1, j), null); }
+    }
+    return plot([
+      {x: nx, y: ny, mode: "lines", name: "Retículo", line: {color: "rgba(150,150,150,0.4)", width: 0.7}, hoverinfo: "skip"},
+      {x: co.x, y: co.y, mode: "markers", name: "Continuar", text: co.text, hoverinfo: "text", marker: {size: 7, color: "rgba(80,80,80,0.7)"}},
+      {x: ex.x, y: ex.y, mode: "markers", name: "Ejercer", text: ex.text, hoverinfo: "text", marker: {size: 9, color: "#d62728", symbol: "diamond"}}
+    ], {hovermode: "closest", xaxis: {title: `tiempo (años) — primeros ${M} de ${q.N} pasos`}, yaxis: {title: "valor del proyecto V"}}, 480);
+  };
+  const realSens = (kind, q) => {
+    const sig = grid(0.05, 0.9, 24), Ts = grid(0.25, 10, 24), n = Math.min(q.N, 60);
+    const a = sig.map(s => lattice(kind, q.V0, q.K, q.f, q.T, q.r, q.d, s, n).value), b = Ts.map(T => lattice(kind, q.V0, q.K, q.f, T, q.r, q.d, q.s, n).value);
+    const base = new Array(2).fill(Math.max(lattice(kind, q.V0, q.K, q.f, q.T, q.r, q.d, q.s, n).pay(q.V0), 0));
+    return {
+      sigma: plot([{x: sig, y: a, name: "Valor de la opción", line: {color: "#1f77b4", width: 2}}, {x: [sig[0], sig.at(-1)], y: base, name: "Pago si se ejerce hoy", line: {color: "black", dash: "dash", width: 1}}],
+        {xaxis: {title: "volatilidad σ", tickformat: ".0%"}, yaxis: {title: "valor de la opción"}}, 420),
+      T: plot([{x: Ts, y: b, name: "Valor de la opción", line: {color: "#1f77b4", width: 2}}, {x: [Ts[0], Ts.at(-1)], y: base, name: "Pago si se ejerce hoy", line: {color: "black", dash: "dash", width: 1}}],
+        {xaxis: {title: "plazo de la opción T (años)"}, yaxis: {title: "valor de la opción"}}, 420)
+    };
+  };
+  const realTable = (kind, q, vstar) => {
+    const L = lattice(kind, q.V0, q.K, q.f, q.T, q.r, q.d, q.s, q.N), flex = realFlex(kind, q.V0, L.value, q.K), st = realStatic(kind, q.V0, q.K);
+    const ms = kind === "defer" ? msThreshold(q.K, q.r, q.d, q.s) : null;
+    const bsRef = kind === "defer" ? bs(q.V0, q.K, q.T, q.r, q.s, true, q.d) : kind === "abandon" ? bs(q.V0, q.K, q.T, q.r, q.s, false, q.d) : null;
+    const dec = L.flag[0][0] ? (kind === "defer" ? "invertir ahora" : kind === "expand" ? "expandir ahora" : "abandonar ahora") : (kind === "defer" ? "esperar" : "mantener la opción");
+    return table(["", "Valor"], [
+      [kind === "defer" ? "VPN estático (V₀ − K)" : "Valor sin flexibilidad (V₀)", fmt(st)],
+      ["Valor de la opción (retículo)", fmt(L.value)],
+      ["Valor con la opción real", fmt(flex)],
+      ["Prima de flexibilidad", fmt(kind === "defer" ? L.value - Math.max(st, 0) : L.value)],
+      ["Umbral crítico V* (retículo)", vstar == null ? "sin ejercicio anticipado" : fmt(vstar)],
+      ["V*/K", vstar == null ? "—" : fmt(vstar / q.K)],
+      ["Umbral McDonald-Siegel (perpetuo)", ms == null ? "—" : isFinite(ms) ? fmt(ms) : "∞ (δ = 0)"],
+      ["Europea Black-Scholes (referencia)", bsRef == null ? "—" : fmt(bsRef)],
+      ["Probabilidad neutral p (↑)", fmt(L.p)],
+      ["Decisión hoy", dec]
+    ]);
+  };
+
+  return {grid, npdf, cnd, residuals, smile, smileFigure, resHist, acfFigure, meanCurves, termDist, passage, mertonDecomp, jumpSizes, csadSeries, herdFit, herdTables, herdScatter, herdRolling, herdCorr, simHerd, herdX, herdStat, herdRet, herdPrices, herdSmile, herdOptTable, critical, realCurves, realLattice, realSens, realTable, bs, iv, mertonCall, lattice, msThreshold, moments, ols};
+}
+```
+
+```{ojs}
+//| output: false
+lib3 = {
+  const {dt, plot, fmt, mean, sd, sum, quantile, ranges, bdays, calibAR, calibMerton} = lib;
+  const {grid, npdf, cnd, bs, iv, mertonCall, lattice, moments, residuals, smile, ols, simHerd} = lib2;
+  const C = {blue: "#1f77b4", red: "#d62728", grey: "rgba(80,80,80,0.6)", green: "#2ca02c"};
+  const pct = x => (100 * x).toFixed(1) + "%";
+  const lfact = [0]; for (let i = 1; i < 600; i++) lfact.push(lfact[i - 1] + Math.log(i));
+  const logret = t => prices[t].slice(1).map((v, i) => Math.log(v / prices[t][i]));
+  const vline = (x, color = "green") => ({type: "line", x0: x, x1: x, yref: "paper", y0: 0, y1: 1, line: {color, dash: "dash", width: 1}});
+  const note = text => ({xref: "paper", yref: "paper", x: 0.98, y: 0.98, xanchor: "right", yanchor: "top", showarrow: false, bgcolor: "white", text});
+
+  const qnorm = p => {
+    const a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00],
+      b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01],
+      c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00],
+      d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00], pl = 0.02425;
+    if (p < pl) { const q = Math.sqrt(-2 * Math.log(p)); return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1); }
+    if (p <= 1 - pl) { const q = p - 0.5, r = q * q; return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1); }
+    const q = Math.sqrt(-2 * Math.log(1 - p)); return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  };
+
+  // ---------- Genéricas ----------
+  const qq = (vals, opts = {}) => {
+    const flags = opts.flags || null, text = opts.text || null, label = opts.label || "valor";
+    const n = vals.length, m = mean(vals), s = sd(vals), idx = vals.map((_, i) => i).sort((i, j) => vals[i] - vals[j]);
+    const tq = idx.map((_, k) => qnorm((k + 0.5) / n)), z = idx.map(i => (vals[i] - m) / s);
+    const lim = 1.05 * Math.max(Math.abs(tq[0]), Math.abs(z[0]), Math.abs(z[n - 1]));
+    const pick = f => { const ks = idx.map((_, k) => k).filter(k => f(idx[k])); return {x: ks.map(k => tq[k]), y: ks.map(k => z[k]), text: ks.map(k => text ? text[idx[k]] : "")}; };
+    const base = {mode: "markers", hovertemplate: "teórico %{x:.2f}<br>muestra %{y:.2f}<br>%{text}<extra></extra>"};
+    const data = [{x: [-lim, lim], y: [-lim, lim], mode: "lines", name: "Normal (y = x)", line: {color: "black", dash: "dash", width: 1}, hoverinfo: "skip"}];
+    if (flags) data.push({...base, ...pick(i => !flags[i]), name: "Difusión", marker: {size: 4, color: C.grey}}, {...base, ...pick(i => flags[i]), name: "Saltos", marker: {size: 7, color: C.red}});
+    else data.push({...base, ...pick(() => true), name: label, marker: {size: 4, color: C.grey}});
+    return plot(data, {hovermode: "closest", xaxis: {title: "cuantil teórico N(0,1)"}, yaxis: {title: `${label} (estandarizado)`}}, 420);
+  };
+  const acfLevel = (X, thetas) => {
+    const n = X.length, m = mean(X); let den = 0; for (let i = 0; i < n; i++) den += (X[i] - m) ** 2;
+    const L = Math.min(126, n - 2), lags = Array.from({length: L}, (_, k) => k + 1);
+    const r = lags.map(k => { let s = 0; for (let i = 0; i + k < n; i++) s += (X[i + k] - m) * (X[i] - m); return s / den; });
+    const dash = ["solid", "dot"], col = [C.blue, C.red];
+    return plot([{x: lags, y: r, name: "ACF empírica", line: {color: "black", width: 2}}].concat(thetas.map((t, i) =>
+      ({x: lags, y: lags.map(k => Math.exp(-t.kappa * k * dt)), name: `e^(−κ·k·Δt), κ ${t.name}`, line: {color: col[i % 2], width: 2, dash: dash[i % 2]}}))),
+      {xaxis: {title: "rezago (días)"}, yaxis: {title: "autocorrelación", range: [Math.min(0, ...r) - 0.05, 1.02]}}, 420);
+  };
+  const riskFigure = (paths, S0) => {
+    const R = Float64Array.from(paths, p => p[p.length - 1] / S0 - 1), s = Float64Array.from(R).sort();
+    const v95 = quantile(s, 0.05), v99 = quantile(s, 0.01), es = v => { const t = Array.from(s).filter(x => x <= v); return t.length ? mean(t) : v; };
+    return plot([{type: "histogram", x: Array.from(R), nbinsx: 60, name: "Retorno al horizonte", marker: {color: C.grey}}], {
+      hovermode: "closest", xaxis: {title: "retorno P_T/P₀ − 1", tickformat: ".0%"}, yaxis: {title: "frecuencia"},
+      shapes: [vline(v95, C.red), vline(v99, "black")],
+      annotations: [note(`VaR 95% = ${pct(v95)} · ES = ${pct(es(v95))}<br>VaR 99% = ${pct(v99)} · ES = ${pct(es(v99))}<br>media = ${pct(mean(R))}`)]}, 420);
+  };
+  const passageHist = (paths, level) => {
+    const steps = paths[0].length, side = Math.sign(paths[0][0] - level) || 1, first = [];
+    paths.forEach(p => { for (let i = 1; i < steps; i++) if ((p[i] - level) * side <= 0) { first.push(i); return; } });
+    const med = first.length ? quantile(Float64Array.from(first).sort(), 0.5) : null;
+    return plot([{type: "histogram", x: first, xbins: {start: 0, end: steps, size: Math.max(1, Math.round(steps / 40))}, histnorm: "probability", name: "Tiempo del primer cruce", marker: {color: C.blue}}],
+      {hovermode: "closest", xaxis: {title: "días hasta el primer cruce (solo trayectorias que cruzan)"}, yaxis: {title: "fracción", tickformat: ".0%"},
+       annotations: [note(`cruzan dentro del horizonte: ${pct(first.length / paths.length)}<br>mediana: ${med == null ? "—" : med.toFixed(0) + " días"}`)]}, 420);
+  };
+  const fanExact = ({ticker, i1, steps, mf, sf, tf = v => v}) => {
+    const fut = bdays(dates[i1], steps), h = prices[ticker], a = Math.max(0, i1 - 252), idx = Array.from({length: steps + 1}, (_, i) => i);
+    const ms = idx.map(i => mf(i * dt)), ss = idx.map(i => sf(i * dt));
+    const data = [
+      {x: dates.slice(a, i1 + 1), y: h.slice(a, i1 + 1), name: "Real (ventana de calibración)", line: {color: "black", width: 1.5}},
+      {x: dates.slice(i1), y: h.slice(i1), name: "Real (posterior)", line: {color: C.red, width: 1.5}}
+    ];
+    [[0.995, "99%", 0.12], [0.95, "90%", 0.2], [0.75, "50%", 0.3]].forEach(([p, nm, al]) => {
+      const z = qnorm(p), up = ms.map((m, i) => tf(m + z * ss[i]));
+      data.push({x: fut, y: up, line: {width: 0}, showlegend: false, hoverinfo: "skip"});
+      data.push({x: fut, y: ms.map((m, i) => tf(m - z * ss[i])), customdata: up, name: `Banda ${nm}`, fill: "tonexty", fillcolor: `rgba(31,119,180,${al})`, line: {width: 0}, hovertemplate: "%{y:.2f} – %{customdata:.2f}"});
+    });
+    data.push({x: fut, y: ms.map(tf), name: "Mediana analítica", line: {color: C.blue, width: 2}});
+    return plot(data, {yaxis: {title: "USD"}}, 480);
+  };
+  const mrHeat = ({x0, kappa, level, sigma, T, P0, toState = v => v, toPrice = v => v}) => {
+    const lvP = toPrice(level), lo = Math.min(0.4 * P0, 0.9 * lvP), hi = Math.max(1.8 * P0, 1.1 * lvP);
+    const Ps = grid(lo, hi, 41), ks = grid(0.02, Math.max(3 * kappa, 3), 31);
+    const z = ks.map(k => Ps.map(P => { const lv = toState(P), m = lv + (x0 - lv) * Math.exp(-k * T), s = sigma * Math.sqrt((1 - Math.exp(-2 * k * T)) / (2 * k)); return 1 - cnd((x0 - m) / s); }));
+    return plot([
+      {type: "heatmap", x: Ps, y: ks, z, zmin: 0, zmax: 1, colorscale: "RdBu", colorbar: {title: "prob.", tickformat: ".0%"}, hovertemplate: "nivel %{x:.1f}<br>κ %{y:.2f}<br>P(P_T ≥ P₀) = %{z:.1%}<extra></extra>"},
+      {x: [lvP], y: [kappa], mode: "markers", name: "parámetros usados", marker: {symbol: "x", size: 13, color: "black", line: {color: "white", width: 1}}}
+    ], {hovermode: "closest", xaxis: {title: "nivel de equilibrio (USD)"}, yaxis: {title: "velocidad de reversión"}, shapes: [{...vline(P0, "black"), x0: P0, x1: P0}],
+        annotations: [{x: P0, y: 1, yref: "paper", text: "P₀", showarrow: false, xanchor: "left", yanchor: "top", bgcolor: "white"}]}, 420);
+  };
+  const negProb = ({paths, P0, kappa, theta, sigma}) => {
+    const steps = paths[0].length - 1, k = Math.max(kappa, 1e-6), idx = Array.from({length: steps + 1}, (_, i) => i);
+    const an = idx.map(i => { const t = i * dt, m = theta + (P0 - theta) * Math.exp(-k * t), s = sigma * Math.sqrt((1 - Math.exp(-2 * k * t)) / (2 * k)); return s > 0 ? cnd(-m / s) : (m < 0 ? 1 : 0); });
+    const mc = idx.map(i => { let c = 0; for (let j = 0; j < paths.length; j++) if (paths[j][i] < 0) c++; return c / paths.length; });
+    return plot([{x: idx, y: an, name: "Analítica Φ(−m/s)", line: {color: C.blue, width: 2}}, {x: idx, y: mc, name: "Monte Carlo", line: {color: C.red, width: 1.5, dash: "dot"}}],
+      {xaxis: {title: "días desde el inicio de la simulación"}, yaxis: {title: "P(precio < 0)", tickformat: ".1%", rangemode: "tozero"}}, 420);
+  };
+  const rolling = series => {
+    const out = {};
+    [126, 252, 504].forEach(W => {
+      const x = [], lvl = [], hl = [], sg = [];
+      for (let e = W; e < series.length; e += 5) {
+        const c = calibAR(series.slice(e - W, e + 1)), span = c.hi - c.lo, ok = c.reverting && c.level > c.lo - span && c.level < c.hi + span;
+        x.push(dates[e]); lvl.push(ok ? c.level : null); hl.push(ok ? c.halfLife : null); sg.push(ok ? c.sigma : null);
+      }
+      out[W] = {x, lvl, hl, sg};
+    });
+    return out;
+  };
+  const rollFigure = (roll, which, o) => {
+    const cols = {126: C.green, 252: C.blue, 504: "#9467bd"}, tf = o.tf || (v => v), data = [];
+    if (o.ticker) data.push({x: dates, y: prices[o.ticker], name: "Precio", line: {color: "rgba(0,0,0,0.35)", width: 1}});
+    Object.keys(roll).forEach(W => data.push({x: roll[W].x, y: roll[W][which].map(v => v == null ? null : tf(v)), name: `ventana ${W} d`, line: {color: cols[W], width: 1.8}}));
+    return plot(data, {yaxis: {title: o.ytitle, type: o.logy ? "log" : "linear"}, xaxis: {rangeselector: {buttons: ranges}},
+      shapes: o.i1 == null ? [] : [vline(dates[o.i1])], annotations: o.i1 == null ? [] : [{x: dates[o.i1], y: 1, yref: "paper", text: "fin de la ventana elegida", showarrow: false, xanchor: "right", yanchor: "top", bgcolor: "white"}]}, 420);
+  };
+
+  // ---------- Merton ----------
+  const mertonDensity = (paths, q, T) => {
+    const L = Array.from(paths, p => Math.log(p[p.length - 1] / p[0])), mo = moments(L);
+    const k = Math.exp(q.muJ + q.sigJ ** 2 / 2) - 1, mT = (q.mu - q.sigma ** 2 / 2 - q.lambda * k) * T, lt = q.lambda * T;
+    const nmax = Math.min(500, Math.ceil(lt + 8 * Math.sqrt(lt) + 10)), xs = grid(mo.m - 5 * mo.s, mo.m + 5 * mo.s, 241);
+    const w = Array.from({length: nmax + 1}, (_, n) => Math.exp(-lt + (n ? n * Math.log(lt) : 0) - lfact[n]));
+    const pdf = x => { let s = 0; for (let n = 0; n <= nmax; n++) s += w[n] * npdf(x, mT + n * q.muJ, Math.sqrt(q.sigma ** 2 * T + n * q.sigJ ** 2)); return s; };
+    return plot([
+      {type: "histogram", x: L, histnorm: "probability density", nbinsx: 50, name: "Monte Carlo", marker: {color: "rgba(80,80,80,0.55)"}},
+      {x: xs, y: xs.map(pdf), mode: "lines", name: "Densidad exacta de Merton (mezcla de Poisson)", line: {color: C.blue, width: 2}},
+      {x: xs, y: xs.map(x => npdf(x, mo.m, mo.s)), mode: "lines", name: "Normal con la misma media y σ", line: {color: C.red, width: 1.5, dash: "dot"}}
+    ], {hovermode: "closest", xaxis: {title: "ln(S_T/S₀)"}, yaxis: {title: "densidad"}, annotations: [note(`asimetría = ${mo.skew.toFixed(2)}<br>curtosis exceso = ${mo.kurt.toFixed(2)}`)]}, 420);
+  };
+  const jumpCounts = (c, q) => {
+    const W = 21, nw = Math.floor(c.r.length / W), cnt = Array.from({length: nw}, (_, k) => c.jump.slice(k * W, (k + 1) * W).filter(Boolean).length);
+    const kmax = Math.min(10, Math.max(5, ...cnt) + 1), ks = Array.from({length: kmax + 1}, (_, k) => k);
+    const obs = ks.map(k => cnt.filter(v => v === k).length), pmf = (mu, k) => Math.exp(-mu + (k ? k * Math.log(mu) : 0) - lfact[k]);
+    const exp = l => ks.map(k => nw * pmf(Math.max(l * W / 252, 1e-9), k));
+    return plot([
+      {type: "bar", x: ks, y: obs, name: "Observado (ventanas de 21 días)", marker: {color: "rgba(80,80,80,0.6)"}},
+      {x: ks, y: exp(c.lambda), mode: "lines+markers", name: "Poisson con λ calibrado", line: {color: C.blue, width: 2}},
+      {x: ks, y: exp(q.lambda), mode: "lines+markers", name: "Poisson con λ usado", line: {color: C.red, width: 2, dash: "dot"}}
+    ], {hovermode: "x unified", xaxis: {title: "saltos en la ventana de 21 días", dtick: 1}, yaxis: {title: `número de ventanas (de ${nw})`}}, 420);
+  };
+  const kSensitivity = ({logp, kNow}) => {
+    const ks = grid(1.5, 6, 19), res = ks.map(k => calibMerton(logp, k));
+    return plot([
+      {x: ks, y: res.map(r => r.lambda), name: "λ (saltos/año)", line: {color: C.blue, width: 2}},
+      {x: ks, y: res.map(r => r.sigma), name: "σ difusión (eje der.)", yaxis: "y2", line: {color: C.red, width: 2}},
+      {x: ks, y: res.map(r => r.sigJ), name: "σ_J (eje der.)", yaxis: "y2", line: {color: C.green, width: 2, dash: "dot"}}
+    ], {xaxis: {title: "umbral de saltos k (×σ)"}, yaxis: {title: "λ (saltos por año)", rangemode: "tozero"}, yaxis2: {title: "σ", overlaying: "y", side: "right", tickformat: ".0%", rangemode: "tozero", automargin: true},
+        shapes: [{...vline(kNow), x0: kNow, x1: kNow}], annotations: [{x: kNow, y: 1, yref: "paper", text: "k usado", showarrow: false, xanchor: "left", yanchor: "top", bgcolor: "white"}]}, 420);
+  };
+  const mertonSurface = ({S, r, q}) => {
+    const ms = grid(0.7, 1.3, 13), Ts = [0.1, 0.25, 0.5, 0.75, 1, 1.5, 2], z = Ts.map(T => smile(S, T, r, ms, K => mertonCall(S, K, T, r, q)));
+    return plot([{type: "surface", x: ms, y: Ts, z, colorscale: "Viridis", colorbar: {title: "vol. impl.", tickformat: ".0%"}, hovertemplate: "K/S₀ %{x:.2f}<br>T %{y:.2f} años<br>σ impl. %{z:.1%}<extra></extra>"}],
+      {hovermode: "closest", margin: {l: 0, r: 0, t: 10, b: 0}, scene: {xaxis: {title: "K/S₀"}, yaxis: {title: "T (años)"}, zaxis: {title: "σ implícita", tickformat: ".0%"}, camera: {eye: {x: 1.6, y: -1.6, z: 0.9}}}}, 460);
+  };
+
+  // ---------- Herding en activos ----------
+  const corrHeat = (R, labels) => {
+    const ms = R.map(mean), ss = R.map((r, i) => Math.sqrt(sum(r.map(v => (v - ms[i]) ** 2))));
+    const z = R.map((a, i) => R.map((b, j) => { let s = 0; for (let t = 0; t < a.length; t++) s += (a[t] - ms[i]) * (b[t] - ms[j]); return s / (ss[i] * ss[j]); }));
+    const off = []; z.forEach((row, i) => row.forEach((v, j) => { if (i !== j) off.push(v); }));
+    return plot([{type: "heatmap", x: labels, y: labels, z, zmin: Math.min(...off), zmax: 1, colorscale: "Blues", texttemplate: "%{z:.2f}", hovertemplate: "%{y} vs %{x}: %{z:.2f}<extra></extra>"}],
+      {hovermode: "closest", yaxis: {autorange: "reversed"}, margin: {l: 55, r: 15, t: 20, b: 40}}, 440);
+  };
+  const csadDeciles = (s, f) => {
+    const n = s.T, idx = Array.from({length: n}, (_, i) => i).sort((i, j) => Math.abs(s.rm[i]) - Math.abs(s.rm[j])), nb = 10, per = Math.floor(n / nb), lab = [], cs = [], am = [], fit = [];
+    for (let b = 0; b < nb; b++) {
+      const ii = idx.slice(b * per, b === nb - 1 ? n : (b + 1) * per), a = mean(ii.map(i => Math.abs(s.rm[i])));
+      lab.push(`D${b + 1}`); am.push(a); cs.push(mean(ii.map(i => s.cs[i]))); fit.push(f.all.beta[0] + f.all.beta[1] * a + f.all.beta[2] * mean(ii.map(i => s.rm[i] ** 2)));
+    }
+    return plot([
+      {type: "bar", x: lab, y: cs, name: "CSAD medio observado", marker: {color: C.grey}, customdata: am, hovertemplate: "decil %{x}<br>|Rm| medio %{customdata:.2%}<br>CSAD medio %{y:.3%}<extra></extra>"},
+      {x: lab, y: fit, mode: "lines+markers", name: "Ajuste CCK (cuadrático)", line: {color: C.red, width: 2}}
+    ], {hovermode: "closest", xaxis: {title: "decil de |Rm| (D1 = calma, D10 = extremo)"}, yaxis: {title: "CSAD medio", tickformat: ".1%"}}, 420);
+  };
+  const herdScatterDate = (s, f) => {
+    const lim = Math.max(...s.rm.map(Math.abs)), xs = grid(-lim, lim, 121), b = f.all.beta, yr = s.x.map(d => +d.slice(0, 4) + (+d.slice(5, 7) - 1) / 12);
+    return plot([
+      {x: s.rm, y: s.cs, mode: "markers", name: "Días", text: s.x, hovertemplate: "%{text}<br>Rm %{x:.2%}<br>CSAD %{y:.2%}<extra></extra>",
+       marker: {size: 5, color: yr, colorscale: "Turbo", colorbar: {title: "año", tickformat: "d", dtick: 1}}},
+      {x: xs, y: xs.map(m => b[0] + b[1] * Math.abs(m) + b[2] * m * m), mode: "lines", name: "Ajuste CCK", line: {color: "black", width: 2}}
+    ], {hovermode: "closest", xaxis: {title: "retorno del mercado Rₘ", tickformat: ".1%"}, yaxis: {title: "CSAD", tickformat: ".1%"}}, 420);
+  };
+  const herdTimeline = (s, f) => {
+    const ext = s.rm.map((m, i) => (m <= f.lo || m >= f.hi) ? i : -1).filter(i => i >= 0);
+    return plot([
+      {x: s.x, y: s.cs, name: "CSAD", line: {color: C.blue, width: 1.3}},
+      {x: s.x, y: s.rm, name: "Rm (eje der.)", yaxis: "y2", line: {color: "rgba(80,80,80,0.45)", width: 1}},
+      {x: ext.map(i => s.x[i]), y: ext.map(i => s.rm[i]), name: "Días extremos (5%)", yaxis: "y2", mode: "markers", marker: {size: 5, color: C.red}}
+    ], {yaxis: {title: "CSAD", tickformat: ".1%"}, yaxis2: {title: "Rm", overlaying: "y", side: "right", tickformat: ".0%", automargin: true}, xaxis: {rangeselector: {buttons: ranges}}}, 420);
+  };
+  const herdRollT = (s, W) => {
+    const x = [], t = [];
+    for (let e = W - 1; e < s.T; e++) { const rm = s.rm.slice(e - W + 1, e + 1), o = ols(rm.map(m => [1, Math.abs(m), m * m]), s.cs.slice(e - W + 1, e + 1), 3); x.push(s.x[e]); t.push(o.t[2]); }
+    const sig = t.map(v => v < -1.645);
+    return plot([
+      {x, y: t, name: "t(γ₂) móvil", line: {color: C.blue, width: 1.5}},
+      {x: x.filter((_, i) => sig[i]), y: t.filter((_, i) => sig[i]), mode: "markers", name: "significativo (t < −1,645)", marker: {size: 5, color: C.red}},
+      {x: [x[0], x[x.length - 1]], y: [-1.645, -1.645], name: "umbral −1,645", line: {color: "black", dash: "dash", width: 1}}
+    ], {yaxis: {title: "t de Newey-West de γ₂"}, xaxis: {rangeselector: {buttons: ranges}},
+        annotations: [note(`ventanas con manada: ${pct(sig.filter(Boolean).length / sig.length)}`)]}, 420);
+  };
+  const herdBox = (s, f) => {
+    const g = fn => s.cs.filter((_, i) => fn(s.rm[i])), mk = (name, y, color) => ({type: "box", y, name, boxmean: true, boxpoints: false, marker: {color}});
+    return plot([mk("Mercado a la baja", g(m => m < 0), C.red), mk("Mercado al alza", g(m => m > 0), C.blue), mk("Caída extrema (P5)", g(m => m <= f.lo), "#8c1c1d"), mk("Alza extrema (P95)", g(m => m >= f.hi), "#0f4a72")],
+      {hovermode: "closest", yaxis: {title: "CSAD", tickformat: ".1%"}, showlegend: false}, 420);
+  };
+
+  // ---------- Herding en opciones ----------
+  const herdFan = xa => {
+    const steps = xa[0].length, qs = [0.05, 0.25, 0.5, 0.75, 0.95], out = qs.map(() => new Array(steps)), mu = new Array(steps);
+    for (let i = 0; i < steps; i++) { const col = Float64Array.from(xa, x => x[i]).sort(); qs.forEach((q, k) => { out[k][i] = quantile(col, q); }); mu[i] = mean(col); }
+    const t = Array.from({length: steps}, (_, i) => i);
+    return plot([
+      {x: t, y: out[4], line: {width: 0}, showlegend: false, hoverinfo: "skip"},
+      {x: t, y: out[0], name: "Banda P5–P95", fill: "tonexty", fillcolor: "rgba(31,119,180,0.15)", line: {width: 0}},
+      {x: t, y: out[3], line: {width: 0}, showlegend: false, hoverinfo: "skip"},
+      {x: t, y: out[1], name: "Banda P25–P75", fill: "tonexty", fillcolor: "rgba(31,119,180,0.3)", line: {width: 0}},
+      {x: t, y: out[2], name: "Mediana", line: {color: C.blue, width: 2}},
+      {x: t, y: mu, name: "Media", line: {color: C.red, width: 1.5, dash: "dot"}}
+    ], {xaxis: {title: "días"}, yaxis: {title: "fracción de optimistas x", range: [0, 1]}, shapes: [{type: "line", xref: "paper", x0: 0, x1: 1, y0: 0.5, y1: 0.5, line: {color: "black", dash: "dash", width: 1}}]}, 420);
+  };
+  const herdXR = (sim, S0) => {
+    const xT = sim.xa.map(x => x[x.length - 1]), R = sim.paths.map(p => Math.log(p[p.length - 1] / S0)), nb = 10, bx = [], by = [];
+    for (let b = 0; b < nb; b++) {
+      const idx = xT.map((_, i) => i).filter(i => xT[i] >= b / nb && (xT[i] < (b + 1) / nb || b === nb - 1));
+      if (idx.length > 3) { bx.push(mean(idx.map(i => xT[i]))); by.push(mean(idx.map(i => R[i]))); }
+    }
+    return plot([
+      {x: xT, y: R, mode: "markers", name: "Trayectorias", marker: {size: 4, color: "rgba(80,80,80,0.35)"}, hovertemplate: "x_T %{x:.2f}<br>ln(S_T/S₀) %{y:.2%}<extra></extra>"},
+      {x: bx, y: by, mode: "lines+markers", name: "Media por decil de x_T", line: {color: C.red, width: 2}}
+    ], {hovermode: "closest", xaxis: {title: "fracción de optimistas al vencimiento x_T", range: [0, 1]}, yaxis: {title: "ln(S_T/S₀)", tickformat: ".0%"}}, 420);
+  };
+  const herdSurface = ({paths, S0, r, steps}) => {
+    const ts = [1 / 6, 2 / 6, 3 / 6, 4 / 6, 5 / 6, 1].map(f => Math.max(5, Math.round(f * steps))), ms = grid(0.8, 1.2, 9);
+    const z = ts.map(t => {
+      const T = t / 252, F = S0 * Math.exp(r * T), ST = Float64Array.from(paths, p => p[t]), adj = F / mean(ST);
+      return ms.map(m => { const K = S0 * m, call = K >= F; return iv(Math.exp(-r * T) * mean(ST.map(v => Math.max(call ? v * adj - K : K - v * adj, 0))), S0, K, T, r, call); });
+    });
+    return plot([{type: "surface", x: ms, y: ts, z, colorscale: "Viridis", colorbar: {title: "vol. impl.", tickformat: ".0%"}, hovertemplate: "K/S₀ %{x:.2f}<br>%{y} días<br>σ impl. %{z:.1%}<extra></extra>"}],
+      {hovermode: "closest", margin: {l: 0, r: 0, t: 10, b: 0}, scene: {xaxis: {title: "K/S₀"}, yaxis: {title: "vencimiento (días)"}, zaxis: {title: "σ implícita", tickformat: ".0%"}, camera: {eye: {x: 1.6, y: -1.6, z: 0.9}}}}, 460);
+  };
+  const herdPriceCurves = (hp, S0, T, r, sigma) => {
+    const ms = grid(0.75, 1.25, 26), Ks = ms.map(m => S0 * m);
+    return plot([
+      {x: ms, y: Ks.map(K => hp.price(K, true)), name: "Call · Monte Carlo", line: {color: C.blue, width: 2}},
+      {x: ms, y: Ks.map(K => bs(S0, K, T, r, sigma, true)), name: "Call · Black-Scholes", line: {color: C.blue, width: 1.5, dash: "dash"}},
+      {x: ms, y: Ks.map(K => hp.price(K, false)), name: "Put · Monte Carlo", line: {color: C.red, width: 2}},
+      {x: ms, y: Ks.map(K => bs(S0, K, T, r, sigma, false)), name: "Put · Black-Scholes", line: {color: C.red, width: 1.5, dash: "dash"}}
+    ], {xaxis: {title: "Moneyness K/S₀"}, yaxis: {title: "prima (USD)"}}, 420);
+  };
+  const herdKurtH = ({S0, q, steps, n, seed}) => {
+    const hs = grid(0.02, 0.5, 10), nn = Math.min(n, 500);
+    const res = hs.map(h => { const sim = simHerd(S0, {...q, h}, steps, nn, seed), mo = moments(sim.paths.map(p => Math.log(p[p.length - 1] / S0))); return {idx: q.N * q.eps / h, ...mo}; });
+    return plot([
+      {x: hs, y: res.map(r => r.kurt), name: "Curtosis en exceso", mode: "lines+markers", customdata: res.map(r => r.idx), hovertemplate: "%{y:.2f} (índice N·ε/h = %{customdata:.2f})", line: {color: C.blue, width: 2}},
+      {x: hs, y: res.map(r => r.skew), name: "Asimetría", mode: "lines+markers", line: {color: C.red, width: 2}}
+    ], {xaxis: {title: "intensidad de imitación h"}, yaxis: {title: "momento del retorno terminal"}, shapes: [{...vline(q.h), x0: q.h, x1: q.h}],
+        annotations: [{x: q.h, y: 1, yref: "paper", text: "h usado", showarrow: false, xanchor: "left", yanchor: "top", bgcolor: "white"}]}, 420);
+  };
+  const herdAcf2 = (paths, ticker, i0, i1) => {
+    const L = 20, acfOf = x => { const n = x.length, m = mean(x); let den = 0; for (let i = 0; i < n; i++) den += (x[i] - m) ** 2;
+      return Array.from({length: L}, (_, k) => { let s = 0; for (let i = 0; i + k + 1 < n; i++) s += (x[i + k + 1] - m) * (x[i] - m); return s / den; }); };
+    const sim = new Array(L).fill(0), use = paths.slice(0, 200);
+    use.forEach(p => { const r = []; for (let i = 0; i < p.length - 1; i++) { const v = Math.log(p[i + 1] / p[i]); r.push(v * v); } acfOf(r).forEach((v, k) => { sim[k] += v / use.length; }); });
+    const h = prices[ticker].slice(i0, i1 + 1), real = acfOf(h.slice(1).map((v, i) => Math.log(v / h[i]) ** 2)), band = 1.96 / Math.sqrt(h.length - 1), lags = Array.from({length: L}, (_, k) => k + 1);
+    return plot([
+      {type: "bar", x: lags, y: real, name: "Histórico del ticker (ventana)", marker: {color: "rgba(80,80,80,0.55)"}},
+      {x: lags, y: sim, mode: "lines+markers", name: "Simulado con manada", line: {color: C.blue, width: 2}},
+      {x: [0.5, L + 0.5], y: [band, band], name: "±1,96/√n", line: {color: C.red, dash: "dash", width: 1}},
+      {x: [0.5, L + 0.5], y: [-band, -band], showlegend: false, line: {color: C.red, dash: "dash", width: 1}}
+    ], {xaxis: {title: "rezago (días)"}, yaxis: {title: "autocorrelación de r²"}}, 420);
+  };
+
+  // ---------- Opciones reales ----------
+  const realBoundary = (kind, q) => {
+    const L = lattice(kind, q.V0, q.K, q.f, q.T, q.r, q.d, q.s, q.N), t = [], b = [], ref = Math.max(q.V0, q.K), top = kind === "abandon" ? 0 : 2.2 * ref;
+    for (let i = 0; i <= q.N; i++) {
+      let best = null;
+      for (let j = 0; j <= i; j++) if (L.flag[i][j]) { const V = L.Vn(i, j); if (best == null || (kind === "abandon" ? V > best : V < best)) best = V; }
+      t.push(i * L.h); b.push(best);
+    }
+    const thr = kind === "expand" ? q.K / Math.max(q.f - 1, 1e-9) : q.K;
+    return plot([
+      {x: t, y: b, name: "Frontera de ejercicio V*(t)", line: {color: C.red, width: 2, shape: "hv"}},
+      {x: t, y: t.map(() => top), name: "Región de ejercicio", fill: "tonexty", fillcolor: "rgba(214,39,40,0.12)", line: {width: 0}, hoverinfo: "skip"},
+      {x: [0, q.T], y: [thr, thr], name: kind === "expand" ? "K/(f−1)" : "K", line: {color: "black", dash: "dash", width: 1}},
+      {x: [0, q.T], y: [q.V0, q.V0], name: "V₀", line: {color: C.blue, dash: "dot", width: 1}}
+    ], {xaxis: {title: "tiempo (años)"}, yaxis: {title: "valor del proyecto V", range: [0, 2.2 * ref]}}, 420);
+  };
+  const realDist = (kind, q) => {
+    const m = Math.log(q.V0) + (q.r - q.d - q.s ** 2 / 2) * q.T, s = q.s * Math.sqrt(q.T), thr = kind === "expand" ? q.K / Math.max(q.f - 1, 1e-9) : q.K;
+    const Vs = grid(Math.exp(m - 3.5 * s), Math.exp(m + 3.5 * s), 200), pdf = V => Math.exp(-0.5 * ((Math.log(V) - m) / s) ** 2) / (V * s * Math.sqrt(2 * Math.PI));
+    const above = kind !== "abandon", inEx = V => above ? V >= thr : V <= thr, pEx = above ? 1 - cnd((Math.log(thr) - m) / s) : cnd((Math.log(thr) - m) / s);
+    const part = f => Vs.filter(f);
+    return plot([
+      {x: part(inEx), y: part(inEx).map(pdf), name: "Región de ejercicio", fill: "tozeroy", fillcolor: "rgba(214,39,40,0.25)", line: {color: C.red, width: 1}},
+      {x: part(V => !inEx(V)), y: part(V => !inEx(V)).map(pdf), name: "Región de no ejercicio", fill: "tozeroy", fillcolor: "rgba(31,119,180,0.2)", line: {color: C.blue, width: 1}}
+    ], {hovermode: "closest", xaxis: {title: "valor del proyecto al plazo V_T (medida neutral al riesgo)"}, yaxis: {title: "densidad"}, shapes: [{...vline(thr, "black"), x0: thr, x1: thr}],
+        annotations: [note(`P(ejercer al plazo) = ${pct(pEx)}<br>E[V_T] = ${fmt(q.V0 * Math.exp((q.r - q.d) * q.T))}`)]}, 420);
+  };
+  const realTornado = (kind, q) => {
+    const n = Math.min(q.N, 60), val = o => lattice(kind, o.V0, o.K, o.f, o.T, o.r, o.d, o.s, n).value, base = val(q);
+    const ps = [["V₀", "V0"], ["K", "K"], ["σ", "s"], ["T", "T"], ["r", "r"], ["δ", "d"]].concat(kind === "expand" ? [["f", "f"]] : []);
+    const rows = ps.map(([lab, key]) => { const lo = val({...q, [key]: q[key] * 0.8}), hi = val({...q, [key]: q[key] * 1.2}); return {lab: `${lab} (${fmt(q[key])})`, lo: lo - base, hi: hi - base}; })
+      .sort((a, b) => Math.max(Math.abs(a.lo), Math.abs(a.hi)) - Math.max(Math.abs(b.lo), Math.abs(b.hi)));
+    return plot([
+      {type: "bar", orientation: "h", y: rows.map(r => r.lab), x: rows.map(r => r.lo), name: "−20 %", marker: {color: C.blue}},
+      {type: "bar", orientation: "h", y: rows.map(r => r.lab), x: rows.map(r => r.hi), name: "+20 %", marker: {color: C.red}}
+    ], {barmode: "overlay", hovermode: "closest", xaxis: {title: `cambio en el valor de la opción (base ${fmt(base)})`}, margin: {l: 110, r: 15, t: 20, b: 40}}, 420);
+  };
+  const realHeat = (kind, q) => {
+    const ref = Math.max(q.V0, q.K), n = Math.min(q.N, 40), Vs = grid(0.3 * ref, 2 * ref, 28), ss = grid(0.05, 0.8, 22);
+    const z = ss.map(s => Vs.map(V => lattice(kind, V, q.K, q.f, q.T, q.r, q.d, s, n).value));
+    return plot([
+      {type: "heatmap", x: Vs, y: ss, z, colorscale: "Viridis", colorbar: {title: "valor"}, hovertemplate: "V %{x:.0f}<br>σ %{y:.0%}<br>valor %{z:.2f}<extra></extra>"},
+      {x: [q.V0], y: [q.s], mode: "markers", name: "parámetros usados", marker: {symbol: "x", size: 13, color: "white", line: {color: "black", width: 1}}}
+    ], {hovermode: "closest", xaxis: {title: "valor presente de los flujos V"}, yaxis: {title: "volatilidad σ", tickformat: ".0%"}}, 420);
+  };
+  const realSigmaCurves = (kind, q) => {
+    const ref = Math.max(q.V0, q.K), n = Math.min(q.N, 50), Vs = grid(0.2 * ref, 2.2 * ref, 50), L0 = lattice(kind, q.V0, q.K, q.f, q.T, q.r, q.d, q.s, n);
+    const data = [{x: Vs, y: Vs.map(V => L0.pay(V)), name: "Pago inmediato", line: {color: "black", dash: "dash", width: 1}}];
+    [0.5, 1, 1.5, 2].forEach(mult => { const s = Math.min(1.5, q.s * mult);
+      data.push({x: Vs, y: Vs.map(V => lattice(kind, V, q.K, q.f, q.T, q.r, q.d, s, n).value), name: `σ = ${pct(s)}${mult === 1 ? " (usada)" : ""}`, line: {width: mult === 1 ? 3 : 1.5}}); });
+    return plot(data, {xaxis: {title: "valor presente de los flujos V"}, yaxis: {title: "valor de la opción"}, shapes: [{...vline(q.V0, "black"), x0: q.V0, x1: q.V0}]}, 420);
+  };
+  const realDelta = (kind, q) => {
+    const ref = Math.max(q.V0, q.K), n = Math.min(q.N, 80), Vs = grid(0.2 * ref, 2.2 * ref, 80), dv = Vs[1] - Vs[0];
+    const val = Vs.map(V => lattice(kind, V, q.K, q.f, q.T, q.r, q.d, q.s, n).value), m = val.length;
+    const del = val.map((_, i) => i === 0 ? (val[1] - val[0]) / dv : i === m - 1 ? (val[i] - val[i - 1]) / dv : (val[i + 1] - val[i - 1]) / (2 * dv));
+    const thr = kind === "expand" ? q.K / Math.max(q.f - 1, 1e-9) : q.K, step = kind === "defer" ? 1 : kind === "expand" ? q.f - 1 : -1;
+    return plot([
+      {x: Vs, y: del, name: "Δ de la opción (∂opción/∂V)", line: {color: C.blue, width: 2.5}},
+      {x: Vs, y: Vs.map(V => (kind === "abandon" ? V < thr : V > thr) ? step : 0), name: "Δ del pago inmediato", line: {color: "black", dash: "dash", width: 1}}
+    ], {xaxis: {title: "valor presente de los flujos V"}, yaxis: {title: "delta (unidades de V cubiertas)"}, shapes: [{...vline(q.V0, "black"), x0: q.V0, x1: q.V0}]}, 420);
+  };
+
+  // ---------- Precio histórico ----------
+  const drawdown = tks => plot(tks.map(t => { let mx = -Infinity; const y = prices[t].map(v => { mx = Math.max(mx, v); return v / mx - 1; }); return {x: dates, y, name: t, line: {width: 1.4}, fill: tks.length === 1 ? "tozeroy" : "none"}; }),
+    {yaxis: {title: "caída desde el máximo", tickformat: ".0%"}, xaxis: {rangeselector: {buttons: ranges}}}, 380);
+  const riskReturn = sel => {
+    const S = Object.keys(prices).map(t => { const r = logret(t); return {t, ret: mean(r) * 252, vol: sd(r) * Math.sqrt(252)}; }), on = t => sel.includes(t);
+    return plot([{x: S.map(s => s.vol), y: S.map(s => s.ret), text: S.map(s => s.t), mode: "markers+text", textposition: "top center", marker: {size: S.map(s => on(s.t) ? 15 : 9), color: S.map(s => on(s.t) ? C.red : C.grey)},
+      hovertemplate: "%{text}<br>vol %{x:.1%}<br>retorno log anual %{y:.1%}<extra></extra>"}], {hovermode: "closest", showlegend: false, xaxis: {title: "volatilidad anualizada", tickformat: ".0%"}, yaxis: {title: "retorno log medio anualizado", tickformat: ".0%"}}, 420);
+  };
+  const retQQ = t => qq(logret(t), {label: `retorno log diario ${t}`, text: dates.slice(1)});
+  const retCorr = sel => { const tks = sel.length >= 2 ? sel : Object.keys(prices); return corrHeat(tks.map(logret), tks); };
+
+  return {qq, acfLevel, riskFigure, passageHist, fanExact, mrHeat, negProb, rolling, rollFigure, mertonDensity, jumpCounts, kSensitivity, mertonSurface,
+    corrHeat, csadDeciles, herdScatterDate, herdTimeline, herdRollT, herdBox, herdFan, herdXR, herdSurface, herdPriceCurves, herdKurtH, herdAcf2,
+    realBoundary, realDist, realTornado, realHeat, realSigmaCurves, realDelta, drawdown, riskReturn, retQQ, retCorr};
 }
 ```
 
@@ -276,6 +992,35 @@ lib.volFigure(selP)
 lib.retHist(selP[0])
 ```
 
+## Row
+
+```{ojs}
+//| title: "Caída desde el máximo (drawdown) de los tickers seleccionados"
+//| width: 50%
+lib3.drawdown(selP)
+```
+
+```{ojs}
+//| title: "Correlación de retornos diarios entre tickers (con menos de 2 seleccionados, todos)"
+//| width: 50%
+lib3.retCorr(selP)
+```
+
+## Row
+
+```{ojs}
+//| title: "Riesgo y retorno por ticker (los seleccionados en rojo)"
+//| width: 50%
+lib3.riskReturn(selP)
+```
+
+```{ojs}
+//| title: "QQ-plot de los retornos log diarios (primer ticker seleccionado) vs. normal"
+//| width: 50%
+lib3.retQQ(selP[0])
+```
+
+
 # Vasicek
 
 ## {.sidebar}
@@ -286,7 +1031,14 @@ lib.retHist(selP[0])
 viewof sV = Inputs.form({
   ticker: Inputs.select(tickers, {label: "Ticker"}),
   from: Inputs.date({label: "Calibrar desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
-  to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)}),
+  to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)})
+})
+```
+
+**Simulación**
+
+```{ojs}
+viewof gV = Inputs.form({
   horizon: Inputs.range([20, 504], {label: "Horizonte (días)", step: 1, value: 252}),
   n: Inputs.range([10, 1000], {label: "Trayectorias", step: 10, value: 200}),
   seed: Inputs.number({label: "Semilla", value: 42, step: 1})
@@ -312,6 +1064,16 @@ viewof pV = {
     sigma: Inputs.range([0.1 * cV.sigma, 3 * cV.sigma], {label: "σ", value: cV.sigma})
   });
 }
+```
+
+```{ojs}
+//| output: false
+simV = lib.simMR(prices[sV.ticker][cV.i1], pV.kappa, pV.theta, pV.sigma, gV.horizon, gV.n, gV.seed)
+```
+
+```{ojs}
+//| output: false
+rollV = lib3.rolling(prices[sV.ticker])
 ```
 
 ## Row
@@ -344,8 +1106,104 @@ lib.table(["", "Calibrado", "Usado"], [
 
 ```{ojs}
 //| title: "Simulación Monte Carlo vs. precio real"
-lib.simFigure({ticker: sV.ticker, i0: cV.i0, i1: cV.i1, level: pV.theta, levelName: "θ",
-  paths: lib.simMR(prices[sV.ticker][cV.i1], pV.kappa, pV.theta, pV.sigma, sV.horizon, sV.n, sV.seed)})
+lib.simFigure({ticker: sV.ticker, i0: cV.i0, i1: cV.i1, level: pV.theta, levelName: "θ", paths: simV})
+```
+
+## Row
+
+```{ojs}
+//| title: "Efecto de κ: media condicional E[Pₜ] con distintas velocidades de reversión"
+//| width: 50%
+lib2.meanCurves({ticker: sV.ticker, i1: cV.i1, x0: prices[sV.ticker][cV.i1], level: pV.theta, kappa: pV.kappa, steps: gV.horizon, tf: x => x, label: "κ"})
+```
+
+```{ojs}
+//| title: "Precio al horizonte: Monte Carlo vs. distribución normal analítica"
+//| width: 50%
+{
+  const T = gV.horizon / 252, P0 = prices[sV.ticker][cV.i1], k = Math.max(pV.kappa, 1e-6);
+  const m = pV.theta + (P0 - pV.theta) * Math.exp(-k * T), s = pV.sigma * Math.sqrt((1 - Math.exp(-2 * k * T)) / (2 * k));
+  return lib2.termDist(simV, y => Math.exp(-0.5 * ((y - m) / s) ** 2) / (s * Math.sqrt(2 * Math.PI)), "Precio al horizonte (USD)", `Normal analítica (μ=${m.toFixed(1)}, σ=${s.toFixed(1)})`);
+}
+```
+
+## Row
+
+```{ojs}
+//| title: "Diagnóstico: residuos de la regresión AR(1) vs. normal"
+//| width: 50%
+lib2.resHist(cV)
+```
+
+```{ojs}
+//| title: "Diagnóstico: autocorrelación de los residuos"
+//| width: 50%
+lib2.acfFigure(cV)
+```
+
+## Row
+
+```{ojs}
+//| title: "Abanico analítico exacto: bandas del 50 %, 90 % y 99 % del precio (Vasicek con los parámetros usados)"
+lib3.fanExact({ticker: sV.ticker, i1: cV.i1, steps: gV.horizon,
+  mf: t => pV.theta + (prices[sV.ticker][cV.i1] - pV.theta) * Math.exp(-Math.max(pV.kappa, 1e-6) * t),
+  sf: t => pV.sigma * Math.sqrt((1 - Math.exp(-2 * Math.max(pV.kappa, 1e-6) * t)) / (2 * Math.max(pV.kappa, 1e-6)))})
+```
+
+## Row
+
+```{ojs}
+//| title: "Riesgo de precio negativo: P(Pₜ < 0) analítica vs. Monte Carlo"
+//| width: 50%
+lib3.negProb({paths: simV, P0: prices[sV.ticker][cV.i1], kappa: pV.kappa, theta: pV.theta, sigma: pV.sigma})
+```
+
+```{ojs}
+//| title: "Primer cruce del nivel de equilibrio θ: probabilidad acumulada"
+//| width: 50%
+lib2.passage(simV, pV.theta, pV.kappa)
+```
+
+## Row
+
+```{ojs}
+//| title: "Probabilidad de que el precio al horizonte supere el actual, según θ y κ"
+//| width: 50%
+lib3.mrHeat({x0: prices[sV.ticker][cV.i1], kappa: pV.kappa, level: pV.theta, sigma: pV.sigma, T: gV.horizon / 252, P0: prices[sV.ticker][cV.i1]})
+```
+
+```{ojs}
+//| title: "Riesgo al horizonte: distribución del retorno con VaR y ES"
+//| width: 50%
+lib3.riskFigure(simV, prices[sV.ticker][cV.i1])
+```
+
+## Row
+
+```{ojs}
+//| title: "Estabilidad de la calibración: θ móvil en ventanas de 126, 252 y 504 días"
+//| width: 50%
+lib3.rollFigure(rollV, "lvl", {ticker: sV.ticker, i1: cV.i1, ytitle: "USD"})
+```
+
+```{ojs}
+//| title: "Estabilidad de la calibración: vida media móvil (días, escala log)"
+//| width: 50%
+lib3.rollFigure(rollV, "hl", {i1: cV.i1, ytitle: "días", logy: true})
+```
+
+## Row
+
+```{ojs}
+//| title: "QQ-plot de los residuos AR(1) vs. normal"
+//| width: 50%
+lib3.qq(lib2.residuals(cV), {label: "residuo"})
+```
+
+```{ojs}
+//| title: "Autocorrelación del precio: empírica vs. decaimiento teórico e^(−κ·k·Δt)"
+//| width: 50%
+lib3.acfLevel(cV.X, [{name: "calibrado", kappa: cV.kappa}, {name: "usado", kappa: pV.kappa}])
 ```
 
 ## Row
@@ -366,7 +1224,15 @@ viewof sM = Inputs.form({
   ticker: Inputs.select(tickers, {label: "Ticker"}),
   from: Inputs.date({label: "Calibrar desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
   to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)}),
-  k: Inputs.range([1.5, 6], {label: "Umbral de saltos (×σ)", step: 0.1, value: 3}),
+  k: Inputs.range([1.5, 6], {label: "Umbral de saltos (×σ)", step: 0.1, value: 3})
+})
+```
+
+**Simulación**
+
+```{ojs}
+viewof gM = Inputs.form({
+  r: Inputs.range([0, 0.1], {label: "Tasa libre de riesgo (opciones)", step: 0.005, value: 0.04}),
   horizon: Inputs.range([20, 504], {label: "Horizonte (días)", step: 1, value: 252}),
   n: Inputs.range([10, 1000], {label: "Trayectorias", step: 10, value: 200}),
   seed: Inputs.number({label: "Semilla", value: 42, step: 1})
@@ -391,6 +1257,11 @@ viewof pM = Inputs.form({
   muJ: Inputs.range([Math.min(-0.3, cM.muJ - 0.1), Math.max(0.3, cM.muJ + 0.1)], {label: "μ_J (salto medio)", value: cM.muJ}),
   sigJ: Inputs.range([0.001, Math.max(0.2, 2 * cM.sigJ)], {label: "σ_J (dispersión)", value: Math.max(cM.sigJ, 0.001)})
 })
+```
+
+```{ojs}
+//| output: false
+simM = lib.simMerton(Math.log(prices[sM.ticker][cM.i1]), pM, gM.horizon, gM.n, gM.seed)
 ```
 
 ## Row
@@ -430,8 +1301,81 @@ lib.table(["", "Calibrado", "Usado"], [
 ```{ojs}
 //| title: "Simulación Monte Carlo vs. precio real"
 //| width: 65%
-lib.simFigure({ticker: sM.ticker, i0: cM.i0, i1: cM.i1, level: null, levelName: "",
-  paths: lib.simMerton(Math.log(prices[sM.ticker][cM.i1]), pM, sM.horizon, sM.n, sM.seed)})
+lib.simFigure({ticker: sM.ticker, i0: cM.i0, i1: cM.i1, level: null, levelName: "", paths: simM})
+```
+
+## Row
+
+```{ojs}
+//| title: "Una trayectoria descompuesta: difusión vs. saltos"
+//| width: 50%
+lib2.mertonDecomp({ticker: sM.ticker, i1: cM.i1}, pM, gM.horizon, gM.seed)
+```
+
+```{ojs}
+//| title: "Precio al horizonte: Monte Carlo vs. lognormal sin saltos"
+//| width: 50%
+{
+  const L = Float64Array.from(simM, p => Math.log(p[p.length - 1])), m = lib.mean(L), s = lib.sd(L);
+  return lib2.termDist(simM, y => y > 0 ? Math.exp(-0.5 * ((Math.log(y) - m) / s) ** 2) / (y * s * Math.sqrt(2 * Math.PI)) : 0, "Precio al horizonte (USD)", "Lognormal ajustada (sin saltos)");
+}
+```
+
+## Row
+
+```{ojs}
+//| title: "Sonrisa de volatilidad implícita (fórmula de Merton 1976)"
+//| width: 50%
+lib2.smileFigure({S: prices[sM.ticker][cM.i1], T: gM.horizon / 252, r: gM.r, flat: pM.sigma,
+  curves: [{name: "Parámetros calibrados", q: cM, line: {color: "#1f77b4", width: 2}}, {name: "Parámetros usados", q: pM, line: {color: "#d62728", width: 2, dash: "dot"}}]})
+```
+
+```{ojs}
+//| title: "Tamaño de los saltos: detectados vs. N(μ_J, σ_J) usado"
+//| width: 50%
+lib2.jumpSizes(cM, pM)
+```
+
+## Row
+
+```{ojs}
+//| title: "QQ-plot de los retornos log diarios: colas pesadas y saltos detectados"
+//| width: 50%
+lib3.qq(cM.r, {flags: cM.jump, text: dates.slice(cM.i0 + 1, cM.i0 + 1 + cM.r.length), label: "retorno log diario"})
+```
+
+```{ojs}
+//| title: "Retorno al horizonte: Monte Carlo vs. densidad exacta de Merton (mezcla de Poisson)"
+//| width: 50%
+lib3.mertonDensity(simM, pM, gM.horizon / 252)
+```
+
+## Row
+
+```{ojs}
+//| title: "Número de saltos por ventana de 21 días: observado vs. Poisson(λ)"
+//| width: 50%
+lib3.jumpCounts(cM, pM)
+```
+
+```{ojs}
+//| title: "Sensibilidad de la calibración al umbral de saltos k"
+//| width: 50%
+lib3.kSensitivity({logp: prices[sM.ticker].slice(cM.i0, cM.i1 + 1).map(v => Math.log(v)), kNow: sM.k})
+```
+
+## Row
+
+```{ojs}
+//| title: "Superficie de volatilidad implícita de Merton (moneyness × plazo): arrástrala para rotarla"
+//| width: 50%
+lib3.mertonSurface({S: prices[sM.ticker][cM.i1], r: gM.r, q: pM})
+```
+
+```{ojs}
+//| title: "Riesgo al horizonte: distribución del retorno con VaR y ES"
+//| width: 50%
+lib3.riskFigure(simM, prices[sM.ticker][cM.i1])
 ```
 
 ## Row
@@ -451,7 +1395,14 @@ tabM
 viewof sO = Inputs.form({
   ticker: Inputs.select(tickers, {label: "Ticker"}),
   from: Inputs.date({label: "Calibrar desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
-  to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)}),
+  to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)})
+})
+```
+
+**Simulación**
+
+```{ojs}
+viewof gO = Inputs.form({
   horizon: Inputs.range([20, 504], {label: "Horizonte (días)", step: 1, value: 252}),
   n: Inputs.range([10, 1000], {label: "Trayectorias", step: 10, value: 200}),
   seed: Inputs.number({label: "Semilla", value: 42, step: 1})
@@ -474,6 +1425,16 @@ viewof pO = Inputs.form({
   mu: Inputs.range([Math.min(cO.level, cO.lo) - 0.5, Math.max(cO.level, cO.hi) + 0.5], {label: "μ (nivel de ln P)", value: cO.level}),
   sigma: Inputs.range([0.1 * cO.sigma, 3 * cO.sigma], {label: "σ", value: cO.sigma})
 })
+```
+
+```{ojs}
+//| output: false
+simO = lib.simMR(Math.log(prices[sO.ticker][cO.i1]), pO.theta, pO.mu, pO.sigma, gO.horizon, gO.n, gO.seed, Math.exp)
+```
+
+```{ojs}
+//| output: false
+rollO = lib3.rolling(prices[sO.ticker].map(v => Math.log(v)))
 ```
 
 ## Row
@@ -507,8 +1468,104 @@ lib.table(["", "Calibrado", "Usado"], [
 
 ```{ojs}
 //| title: "Simulación Monte Carlo vs. precio real"
-lib.simFigure({ticker: sO.ticker, i0: cO.i0, i1: cO.i1, level: Math.exp(pO.mu), levelName: "exp(μ)",
-  paths: lib.simMR(Math.log(prices[sO.ticker][cO.i1]), pO.theta, pO.mu, pO.sigma, sO.horizon, sO.n, sO.seed, Math.exp)})
+lib.simFigure({ticker: sO.ticker, i0: cO.i0, i1: cO.i1, level: Math.exp(pO.mu), levelName: "exp(μ)", paths: simO})
+```
+
+## Row
+
+```{ojs}
+//| title: "Efecto de θ: mediana condicional exp(E[ln Pₜ]) con distintas velocidades"
+//| width: 50%
+lib2.meanCurves({ticker: sO.ticker, i1: cO.i1, x0: Math.log(prices[sO.ticker][cO.i1]), level: pO.mu, kappa: pO.theta, steps: gO.horizon, tf: Math.exp, label: "θ"})
+```
+
+```{ojs}
+//| title: "Precio al horizonte: Monte Carlo vs. lognormal analítica"
+//| width: 50%
+{
+  const T = gO.horizon / 252, x0 = Math.log(prices[sO.ticker][cO.i1]), k = Math.max(pO.theta, 1e-6);
+  const m = pO.mu + (x0 - pO.mu) * Math.exp(-k * T), s = pO.sigma * Math.sqrt((1 - Math.exp(-2 * k * T)) / (2 * k));
+  return lib2.termDist(simO, y => y > 0 ? Math.exp(-0.5 * ((Math.log(y) - m) / s) ** 2) / (y * s * Math.sqrt(2 * Math.PI)) : 0, "Precio al horizonte (USD)", "Lognormal analítica");
+}
+```
+
+## Row
+
+```{ojs}
+//| title: "Primer cruce del nivel de equilibrio exp(μ): probabilidad acumulada"
+//| width: 50%
+lib2.passage(simO, Math.exp(pO.mu), pO.theta)
+```
+
+```{ojs}
+//| title: "Diagnóstico: autocorrelación de los residuos de ln P"
+//| width: 50%
+lib2.acfFigure(cO)
+```
+
+## Row
+
+```{ojs}
+//| title: "Abanico analítico exacto: mediana y bandas del 50 %, 90 % y 99 % del precio (OU sobre ln P)"
+lib3.fanExact({ticker: sO.ticker, i1: cO.i1, steps: gO.horizon, tf: Math.exp,
+  mf: t => pO.mu + (Math.log(prices[sO.ticker][cO.i1]) - pO.mu) * Math.exp(-Math.max(pO.theta, 1e-6) * t),
+  sf: t => pO.sigma * Math.sqrt((1 - Math.exp(-2 * Math.max(pO.theta, 1e-6) * t)) / (2 * Math.max(pO.theta, 1e-6)))})
+```
+
+## Row
+
+```{ojs}
+//| title: "Probabilidad de que el precio al horizonte supere el actual, según exp(μ) y θ"
+//| width: 50%
+lib3.mrHeat({x0: Math.log(prices[sO.ticker][cO.i1]), kappa: pO.theta, level: pO.mu, sigma: pO.sigma, T: gO.horizon / 252, P0: prices[sO.ticker][cO.i1], toState: Math.log, toPrice: Math.exp})
+```
+
+```{ojs}
+//| title: "Riesgo al horizonte: distribución del retorno con VaR y ES"
+//| width: 50%
+lib3.riskFigure(simO, prices[sO.ticker][cO.i1])
+```
+
+## Row
+
+```{ojs}
+//| title: "Estabilidad de la calibración: exp(μ) móvil en ventanas de 126, 252 y 504 días"
+//| width: 50%
+lib3.rollFigure(rollO, "lvl", {ticker: sO.ticker, i1: cO.i1, tf: Math.exp, ytitle: "exp(μ) (USD)"})
+```
+
+```{ojs}
+//| title: "Estabilidad de la calibración: vida media móvil (días, escala log)"
+//| width: 50%
+lib3.rollFigure(rollO, "hl", {i1: cO.i1, ytitle: "días", logy: true})
+```
+
+## Row
+
+```{ojs}
+//| title: "Tiempo hasta el primer cruce de exp(μ): distribución"
+//| width: 50%
+lib3.passageHist(simO, Math.exp(pO.mu))
+```
+
+```{ojs}
+//| title: "QQ-plot de los residuos AR(1) de ln P vs. normal"
+//| width: 50%
+lib3.qq(lib2.residuals(cO), {label: "residuo"})
+```
+
+## Row
+
+```{ojs}
+//| title: "Autocorrelación de ln P: empírica vs. decaimiento teórico e^(−θ·k·Δt)"
+//| width: 50%
+lib3.acfLevel(cO.X, [{name: "calibrado", kappa: cO.kappa}, {name: "usado", kappa: pO.theta}])
+```
+
+```{ojs}
+//| title: "Estabilidad de la calibración: σ móvil (ln P)"
+//| width: 50%
+lib3.rollFigure(rollO, "sg", {i1: cO.i1, ytitle: "σ calibrado"})
 ```
 
 ## Row
@@ -517,3 +1574,413 @@ lib.simFigure({ticker: sO.ticker, i0: cO.i0, i1: cO.i1, level: Math.exp(pO.mu), 
 #| title: "Referencia: calibración FinStoch sobre ln P (muestra completa, todos los tickers)"
 tabO
 ```
+
+# Herding: activos
+
+## {.sidebar}
+
+**Muestra**
+
+```{ojs}
+viewof sA = Inputs.form({
+  tk: Inputs.checkbox(tickers, {label: "Activos del universo", value: tickers}),
+  from: Inputs.date({label: "Desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
+  to: Inputs.date({label: "Hasta", value: dates.at(-1), min: dates[0], max: dates.at(-1)}),
+  W: Inputs.range([40, 250], {label: "Ventana móvil (días)", step: 5, value: 120})
+})
+```
+
+```{ojs}
+//| output: false
+cA = {
+  const [i0, i1] = lib.between(sA.from, sA.to);
+  const tks = sA.tk.length >= 3 ? sA.tk : tickers;
+  const s = lib2.csadSeries(tks, i0, i1);
+  return {s, tks, f: lib2.herdFit(s), W: Math.max(20, Math.min(sA.W, s.T - 20))};
+}
+```
+
+## Row
+
+Modelo de Chang, Cheng y Khorana (2000): `CSADₜ = α + γ₁·|Rₘ,ₜ| + γ₂·Rₘ,ₜ² + εₜ`, donde `CSADₜ = (1/N)·Σ|rᵢ,ₜ − Rₘ,ₜ|` es la dispersión absoluta transversal de los retornos y `Rₘ,ₜ` el retorno equiponderado del universo. **Idea:** sin manada, la dispersión crece linealmente con |Rₘ| (los activos reaccionan de forma distinta al mercado); con manada, en días de movimientos fuertes los inversionistas imitan al consenso, la dispersión se comprime y `γ₂ < 0`. Los t-valores usan errores de Newey-West (5 rezagos); se declara manada si `t(γ₂) < −1,645`. El panel móvil muestra cuándo aparece y se contrasta con la correlación media entre activos. Con solo 10 acciones de gran capitalización el test tiene poca potencia: úsalo como ilustración del método, no como prueba concluyente.
+
+## Row
+
+```{ojs}
+//| title: "CSAD vs. retorno del mercado: ajuste cuadrático (CCK) y benchmark lineal"
+//| width: 50%
+lib2.herdScatter(cA.s, cA.f)
+```
+
+```{ojs}
+//| title: "Coeficientes (t de Newey-West entre paréntesis)"
+//| width: 50%
+lib2.herdTables(cA.f)
+```
+
+## Row
+
+```{ojs}
+//| title: "γ₂ en ventana móvil: ¿cuándo hay manada?"
+//| width: 50%
+lib2.herdRolling(cA.s, cA.W)
+```
+
+```{ojs}
+//| title: "Dispersión (CSAD) y correlación media entre activos"
+//| width: 50%
+lib2.herdCorr(cA.s, cA.W)
+```
+
+## Row
+
+```{ojs}
+//| title: "Correlación de retornos diarios entre los activos de la muestra"
+//| width: 50%
+lib3.corrHeat(cA.s.R, cA.tks)
+```
+
+```{ojs}
+//| title: "CSAD medio por decil de |Rₘ|: ¿se comprime la dispersión en los extremos?"
+//| width: 50%
+lib3.csadDeciles(cA.s, cA.f)
+```
+
+## Row
+
+```{ojs}
+//| title: "CSAD vs. Rₘ coloreado por fecha: ¿cambia el régimen en el tiempo?"
+//| width: 50%
+lib3.herdScatterDate(cA.s, cA.f)
+```
+
+```{ojs}
+//| title: "CSAD y retorno de mercado en el tiempo (días extremos marcados)"
+//| width: 50%
+lib3.herdTimeline(cA.s, cA.f)
+```
+
+## Row
+
+```{ojs}
+//| title: "t de Newey-West de γ₂ en ventana móvil"
+//| width: 50%
+lib3.herdRollT(cA.s, cA.W)
+```
+
+```{ojs}
+//| title: "CSAD según el régimen de mercado (baja, alza y extremos)"
+//| width: 50%
+lib3.herdBox(cA.s, cA.f)
+```
+
+
+# Herding: opciones
+
+## {.sidebar}
+
+**Calibración**
+
+```{ojs}
+viewof sH = Inputs.form({
+  ticker: Inputs.select(tickers, {label: "Ticker"}),
+  from: Inputs.date({label: "Calibrar desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
+  to: Inputs.date({label: "Calibrar hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)})
+})
+```
+
+**Simulación**
+
+```{ojs}
+viewof gH = Inputs.form({
+  horizon: Inputs.range([20, 504], {label: "Vencimiento (días)", step: 1, value: 63}),
+  n: Inputs.range([200, 3000], {label: "Trayectorias", step: 100, value: 1000}),
+  seed: Inputs.number({label: "Semilla", value: 42, step: 1}),
+  r: Inputs.range([0, 0.1], {label: "Tasa libre de riesgo", step: 0.005, value: 0.04})
+})
+```
+
+```{ojs}
+//| output: false
+cHo = {
+  const [i0, i1] = lib.between(sH.from, sH.to), p = prices[sH.ticker].slice(i0, i1 + 1);
+  const r = p.slice(1).map((v, i) => Math.log(v / p[i]));
+  return {i0, i1, S0: p[p.length - 1], sigma: lib.sd(r) * Math.sqrt(252)};
+}
+```
+
+**Parámetros del modelo de manada**
+
+```{ojs}
+viewof pHo = Inputs.form({
+  N: Inputs.range([20, 300], {label: "N (agentes)", step: 10, value: 100}),
+  eps: Inputs.range([0.0001, 0.02], {label: "ε (cambio autónomo, diario)", step: 0.0001, value: 0.001}),
+  h: Inputs.range([0.01, 0.5], {label: "h (imitación, diario)", step: 0.01, value: 0.2}),
+  beta: Inputs.range([0, 3], {label: "β (sesgo del drift)", step: 0.05, value: 1.5}),
+  kappa: Inputs.range([0, 2], {label: "κ (amplif. de volatilidad)", step: 0.05, value: 0.5}),
+  sigma: Inputs.range([0.05, Math.max(1, 2 * cHo.sigma)], {label: "σ base", value: cHo.sigma})
+})
+```
+
+```{ojs}
+//| output: false
+simHo = lib2.simHerd(cHo.S0, {...pHo, r: gH.r}, gH.horizon, gH.n, gH.seed)
+```
+
+```{ojs}
+//| output: false
+hpHo = lib2.herdPrices(simHo.paths, cHo.S0, gH.horizon / 252, gH.r, pHo.sigma)
+```
+
+## Row
+
+Modelo de Kirman (1993) en la versión de Alfarano, Lux y Wagner: `N` agentes, cada uno optimista (1) o pesimista (0). Cada día un agente cambia de bando con probabilidad `ε + h·(fracción del bando contrario)`: `ε` es el cambio autónomo e `h` la imitación. El **índice de manada** `N·ε/h` decide el régimen: si es menor que 1, la fracción de optimistas `x` es bimodal (consensos extremos y largos). El sentimiento `m = 2x − 1` mueve el drift (`β·m`) y amplifica la volatilidad (`σ·(1 + κ|m|)`). Las opciones se valoran por Monte Carlo corrigiendo la martingala (`E[S_T] = S₀·e^{rT}`) y la sonrisa de volatilidad sale de la mezcla de regímenes de sentimiento. Es una valoración ilustrativa: el repositorio no tiene precios de opciones para contrastarla.
+
+## Row
+
+```{ojs}
+//| title: "Fracción de optimistas xₜ en 6 trayectorias"
+//| width: 65%
+lib2.herdX(simHo.xs)
+```
+
+```{ojs}
+//| title: "Parámetros y diagnóstico"
+//| width: 35%
+{
+  const idx = pHo.N * pHo.eps / pHo.h, T = gH.horizon / 252;
+  const r = Array.from(simHo.paths, p => Math.log(p[p.length - 1] / cHo.S0)), mo = lib2.moments(r);
+  return lib.table(["", "Valor"], [
+    ["Índice de manada N·ε/h", lib.fmt(idx)],
+    ["Régimen de x", idx < 1 ? "bimodal (manada fuerte)" : "unimodal (sin manada)"],
+    ["σ base calibrado", lib.fmt(cHo.sigma)],
+    ["σ base usado", lib.fmt(pHo.sigma)],
+    ["Asimetría del retorno terminal", lib.fmt(mo.skew)],
+    ["Curtosis en exceso", lib.fmt(mo.kurt)],
+    ["Factor de corrección martingala", lib.fmt(hpHo.adj)],
+    ["Vencimiento (años)", lib.fmt(T)]
+  ]);
+}
+```
+
+## Row
+
+```{ojs}
+//| title: "Simulación Monte Carlo vs. precio real"
+lib.simFigure({ticker: sH.ticker, i0: cHo.i0, i1: cHo.i1, level: null, levelName: "", paths: simHo.paths})
+```
+
+## Row
+
+```{ojs}
+//| title: "Sonrisa de volatilidad implícita bajo manada"
+//| width: 50%
+lib2.herdSmile(hpHo, pHo.sigma)
+```
+
+```{ojs}
+//| title: "Retorno terminal: simulado vs. normal"
+//| width: 50%
+lib2.herdRet(simHo.paths, cHo.S0)
+```
+
+## Row
+
+```{ojs}
+//| title: "Distribución de largo plazo de x vs. Beta(Nε/h, Nε/h)"
+//| width: 50%
+lib2.herdStat(pHo)
+```
+
+```{ojs}
+//| title: "Precios de opciones europeas (Monte Carlo) vs. Black-Scholes"
+//| width: 50%
+lib2.herdOptTable(hpHo, cHo.S0, gH.horizon / 252, gH.r, pHo.sigma)
+```
+
+## Row
+
+```{ojs}
+//| title: "Abanico del sentimiento xₜ (todas las trayectorias): mediana y bandas"
+//| width: 50%
+lib3.herdFan(simHo.xa)
+```
+
+```{ojs}
+//| title: "Retorno terminal vs. sentimiento final: ¿quién gana, optimistas o pesimistas?"
+//| width: 50%
+lib3.herdXR(simHo, cHo.S0)
+```
+
+## Row
+
+```{ojs}
+//| title: "Superficie de volatilidad implícita bajo manada (moneyness × vencimiento): arrástrala para rotarla"
+//| width: 50%
+lib3.herdSurface({paths: simHo.paths, S0: cHo.S0, r: gH.r, steps: gH.horizon})
+```
+
+```{ojs}
+//| title: "Primas europeas por strike: Monte Carlo con manada vs. Black-Scholes"
+//| width: 50%
+lib3.herdPriceCurves(hpHo, cHo.S0, gH.horizon / 252, gH.r, pHo.sigma)
+```
+
+## Row
+
+```{ojs}
+//| title: "Curtosis y asimetría del retorno terminal según la intensidad de imitación h"
+//| width: 50%
+lib3.herdKurtH({S0: cHo.S0, q: {...pHo, r: gH.r}, steps: gH.horizon, n: gH.n, seed: gH.seed})
+```
+
+```{ojs}
+//| title: "Agrupamiento de volatilidad: ACF de r² simulada vs. histórica"
+//| width: 50%
+lib3.herdAcf2(simHo.paths, sH.ticker, cHo.i0, cHo.i1)
+```
+
+
+# Opciones reales
+
+## {.sidebar}
+
+**Opción real y riesgo**
+
+```{ojs}
+viewof sR = Inputs.form({
+  kind: Inputs.select(new Map([["Diferir la inversión (call americana)", "defer"], ["Expandir (call sobre el incremento)", "expand"], ["Abandonar (put americana)", "abandon"]]), {label: "Opción real"}),
+  ticker: Inputs.select(tickers, {label: "Proxy de riesgo (ticker)"}),
+  from: Inputs.date({label: "Calibrar σ desde", value: dates[0], min: dates[0], max: dates.at(-1)}),
+  to: Inputs.date({label: "Calibrar σ hasta", value: "2023-12-31", min: dates[0], max: dates.at(-1)})
+})
+```
+
+**Mercado y retículo**
+
+```{ojs}
+viewof gR = Inputs.form({
+  T: Inputs.range([0.5, 10], {label: "Plazo de la opción T (años)", step: 0.5, value: 3}),
+  N: Inputs.range([10, 200], {label: "Pasos del retículo", step: 5, value: 50}),
+  r: Inputs.range([0, 0.15], {label: "Tasa libre de riesgo", step: 0.005, value: 0.04}),
+  d: Inputs.range([0, 0.15], {label: "δ (rendimiento de flujos, costo de esperar)", step: 0.005, value: 0.04})
+})
+```
+
+```{ojs}
+//| output: false
+cR = {
+  const [i0, i1] = lib.between(sR.from, sR.to), p = prices[sR.ticker].slice(i0, i1 + 1);
+  return {i0, i1, sigma: lib.sd(p.slice(1).map((v, i) => Math.log(v / p[i]))) * Math.sqrt(252)};
+}
+```
+
+**Parámetros del proyecto** (σ arranca en lo calibrado)
+
+```{ojs}
+viewof pR = Inputs.form({
+  V0: Inputs.range([10, 300], {label: "V₀ (valor presente de los flujos)", step: 1, value: 100}),
+  K: Inputs.range([10, 300], {label: "K (inversión / costo de expandir / valor de rescate)", step: 1, value: {defer: 100, expand: 60, abandon: 80}[sR.kind]}),
+  f: Inputs.range([1.05, 2.5], {label: "f (factor de expansión)", step: 0.05, value: 1.5}),
+  sigma: Inputs.range([0.05, Math.max(1, 2 * cR.sigma)], {label: "σ del proyecto", value: cR.sigma})
+})
+```
+
+```{ojs}
+//| output: false
+qR = {
+  return {V0: pR.V0, K: pR.K, f: pR.f, T: gR.T, r: gR.r, d: gR.d, s: pR.sigma, N: gR.N};
+}
+```
+
+```{ojs}
+//| output: false
+vR = lib2.critical(sR.kind, qR)
+```
+
+```{ojs}
+//| output: false
+sensR = lib2.realSens(sR.kind, qR)
+```
+
+## Row
+
+Opciones reales (Dixit y Pindyck; Trigeorgis): la flexibilidad gerencial se valora como una opción financiera sobre el valor presente `V` de los flujos del proyecto, que sigue un movimiento browniano geométrico con volatilidad `σ` y rendimiento `δ`. **Diferir**: call americana con precio de ejercicio `K` (la inversión); esperar tiene valor porque se puede invertir solo si `V` sube, y el umbral `V*` es mayor que `K`. **Expandir**: se paga `K` para obtener `(f − 1)·V` adicional. **Abandonar**: put americana con precio de ejercicio `K` (valor de rescate). El valor se calcula en un retículo binomial CRR con ejercicio anticipado; para diferir se muestra además el umbral perpetuo de McDonald-Siegel `V* = β/(β−1)·K`. La volatilidad se calibra con los retornos del ticker elegido como proxy del riesgo del proyecto.
+
+## Row
+
+```{ojs}
+//| title: "Valor del proyecto con y sin la opción real"
+//| width: 65%
+lib2.realCurves(sR.kind, qR, vR)
+```
+
+```{ojs}
+//| title: "Valoración y decisión"
+//| width: 35%
+lib2.realTable(sR.kind, qR, vR)
+```
+
+## Row
+
+```{ojs}
+//| title: "Retículo binomial: nodos donde conviene ejercer"
+lib2.realLattice(sR.kind, qR)
+```
+
+## Row
+
+```{ojs}
+//| title: "Sensibilidad: valor de la opción vs. volatilidad"
+//| width: 50%
+sensR.sigma
+```
+
+```{ojs}
+//| title: "Sensibilidad: valor de la opción vs. plazo"
+//| width: 50%
+sensR.T
+```
+
+## Row
+
+```{ojs}
+//| title: "Frontera de ejercicio óptimo V*(t) en el retículo"
+//| width: 50%
+lib3.realBoundary(sR.kind, qR)
+```
+
+```{ojs}
+//| title: "Distribución del valor del proyecto al plazo y probabilidad de ejercicio"
+//| width: 50%
+lib3.realDist(sR.kind, qR)
+```
+
+## Row
+
+```{ojs}
+//| title: "Tornado: efecto de ±20 % en cada parámetro sobre el valor de la opción"
+//| width: 50%
+lib3.realTornado(sR.kind, qR)
+```
+
+```{ojs}
+//| title: "Mapa de calor: valor de la opción según V y σ"
+//| width: 50%
+lib3.realHeat(sR.kind, qR)
+```
+
+## Row
+
+```{ojs}
+//| title: "Valor de la opción vs. V para distintas volatilidades"
+//| width: 50%
+lib3.realSigmaCurves(sR.kind, qR)
+```
+
+```{ojs}
+//| title: "Delta de la opción (cobertura) vs. V"
+//| width: 50%
+lib3.realDelta(sR.kind, qR)
+```
+

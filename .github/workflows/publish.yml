@@ -15,36 +15,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Ensure gh-pages branch exists
-        run: |
-          if ! git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git checkout --orphan gh-pages
-            git rm -rf . > /dev/null 2>&1 || true
-            git commit --allow-empty -m "Initialize gh-pages branch"
-            git push origin gh-pages
-            git checkout main
-          fi
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Register Jupyter kernel 'defi2'
-        run: python -m ipykernel install --user --name defi2 --display-name "defi2"
-
+      - run: pip install -r requirements.txt
       - uses: quarto-dev/quarto-actions/setup@v2
-
-      - name: Render site
-        run: quarto render
-
+      - run: quarto render
       - uses: quarto-dev/quarto-actions/publish@v2
         with:
           target: gh-pages

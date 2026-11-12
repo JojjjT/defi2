@@ -67,3 +67,25 @@
   .quarto-dashboard .card table { font-size: .78rem; }
   .quarto-dashboard .card.cell { min-height: 300px; }
 }
+
+/* ===== Barra lateral de parámetros: llega hasta el final de los gráficos =====
+   La columna se estira a toda la altura de la página (donde terminan las
+   gráficas); los controles quedan "pegados" arriba y se desplazan con el
+   scroll para seguir a la vista. Solo en escritorio (≥ 992 px). */
+@media (min-width: 992px) {
+  .quarto-dashboard .dashboard-page .bslib-sidebar-layout > .sidebar {
+    position: relative !important;
+    height: auto !important;
+    max-height: none !important;
+    align-self: stretch;
+    overflow: visible !important;
+  }
+  .quarto-dashboard .dashboard-page .bslib-sidebar-layout > .sidebar > .sidebar-content,
+  .quarto-dashboard .dashboard-page .bslib-sidebar-layout > .sidebar > div:first-child {
+    position: sticky;
+    top: .5rem;
+    max-height: calc(100vh - 1rem);
+    overflow-y: auto;
+    flex: 0 0 auto;
+  }
+}
